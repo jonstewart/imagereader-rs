@@ -1,11 +1,15 @@
 use kaitai::{BytesReader, KError, ReadSeek};
 use rayon::prelude::*;
 use std::{
+    cell::Cell,
     collections::HashMap,
     fmt::Debug,
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex, Weak},
+    sync::{
+        Arc, LazyLock, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::runtime::Runtime;
 use tracing::{debug, warn};
@@ -647,6 +651,51 @@ enum ChunkStore {
     },
 }
 
+/// Number of independently locked worker lists. Each thread draws from one,
+/// so concurrent readers rarely contend for a worker.
+const WORKER_POOL_SHARDS: usize = 16;
+
+static NEXT_WORKER_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static WORKER_SHARD: Cell<usize> =
+        Cell::new(NEXT_WORKER_SHARD.fetch_add(1, Ordering::Relaxed) % WORKER_POOL_SHARDS);
+}
+
+/// Decoder scratch, checked out per chunk.
+///
+/// A ReadWorker is an inflater plus two chunk-sized buffers (~64 KiB), so
+/// pooling them costs a little memory per concurrent read and nothing else.
+/// A lock is held only to pop and push, never across a read, and threads are
+/// spread over shards so that even that rarely contends.
+struct WorkerPool {
+    shards: Box<[Mutex<Vec<ReadWorker>>]>,
+}
+
+impl WorkerPool {
+    fn new() -> Self {
+        Self {
+            shards: (0..WORKER_POOL_SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+
+    fn shard(&self) -> &Mutex<Vec<ReadWorker>> {
+        &self.shards[WORKER_SHARD.with(Cell::get)]
+    }
+
+    fn checkout(&self, new: impl FnOnce() -> ReadWorker) -> ReadWorker {
+        let pooled = self.shard().lock().expect("worker pool poisoned").pop();
+        pooled.unwrap_or_else(new)
+    }
+
+    fn give_back(&self, worker: ReadWorker) {
+        self.shard()
+            .lock()
+            .expect("worker pool poisoned")
+            .push(worker);
+    }
+}
+
 pub struct E01Reader {
     chunks: Vec<Chunk>,
 
@@ -664,17 +713,15 @@ pub struct E01Reader {
 
     corrupt_chunk_policy: CorruptChunkPolicy,
 
-    /// Decoder scratch, checked out per read.
+    /// Decoder scratch. `read_at_offset` takes `&self`, so a reader serves
+    /// concurrent reads without a lock around it: the workers are the only
+    /// mutable state a read needs, and each read checks out its own.
     ///
-    /// This is the *only* thing `read_at_offset` ever needed `&mut self` for --
-    /// and that `&mut` forced a server to put the whole reader behind one lock,
-    /// so every client serialized on it: 8 concurrent clients got *less*
-    /// throughput than one (34 vs 38 MiB/s) with a p99 of 28ms against 0.35ms.
-    ///
-    /// A ReadWorker is an inflater plus two chunk-sized buffers (~64 KiB),
-    /// so pooling them costs a little memory per concurrent read and nothing
-    /// else. The lock is held only to pop and push, never across a read.
-    worker_pool: Mutex<Vec<ReadWorker>>,
+    /// (`read_at_offset` used to take `&mut self` for exactly this, which
+    /// forced a server to put the whole reader behind one lock: 8 concurrent
+    /// clients got *less* throughput than one, with a p99 of 28ms against
+    /// 0.35ms.)
+    worker_pool: WorkerPool,
     store: ChunkStore,
     /// `None` disables the decoded-chunk cache entirely -- there is then no
     /// lock to take and no chunk to insert, rather than a cache that is merely
@@ -688,14 +735,13 @@ pub struct E01Reader {
 
 const DECODED_CHUNK_CACHE_CHUNKS: usize = 1024;
 
-/// One chunk's worth of a read: which chunk, which part of it, where in the
-/// caller's buffer it goes, and the worker to decode it with.
+/// One chunk's worth of a read: which chunk, which part of it, and where in
+/// the caller's buffer it goes.
 struct ChunkTask<'a> {
     chunk_index: usize,
     buf: &'a mut [u8],
     beg_in_chunk: usize,
     end_in_chunk: usize,
-    worker: &'a mut ReadWorker,
 }
 
 /// Threads this process may actually use.
@@ -745,27 +791,6 @@ fn chunk_pool(requested: usize) -> Result<Option<Arc<rayon::ThreadPool>>, OpenEr
 }
 
 impl E01Reader {
-    /// `n` workers, reusing pooled ones and building the rest.
-    fn checkout_workers(&self, n: usize) -> Vec<ReadWorker> {
-        let mut pool = self.worker_pool.lock().expect("worker pool poisoned");
-
-        let keep = pool.len().saturating_sub(n);
-        let mut workers: Vec<ReadWorker> = pool.drain(keep..).collect();
-        drop(pool);
-
-        workers.resize_with(n, || {
-            ReadWorker::new(self.chunk_size, self.image_size, self.corrupt_chunk_policy)
-        });
-        workers
-    }
-
-    fn return_workers(&self, workers: Vec<ReadWorker>) {
-        self.worker_pool
-            .lock()
-            .expect("worker pool poisoned")
-            .extend(workers);
-    }
-
     /// Read one chunk's part of a read.
     fn read_task(
         &self,
@@ -773,10 +798,13 @@ impl E01Reader {
         foyer_trace: Option<&Mutex<ReadTrace>>,
     ) -> Result<(), ReadError> {
         let chunk = &self.chunks[task.chunk_index];
+        let mut worker = self.worker_pool.checkout(|| {
+            ReadWorker::new(self.chunk_size, self.image_size, self.corrupt_chunk_policy)
+        });
         let cache = self.decoded_chunk_cache.as_ref();
 
-        match &self.store {
-            ChunkStore::Local(files) => task.worker.read_chunk(
+        let result = match &self.store {
+            ChunkStore::Local(files) => worker.read_chunk(
                 chunk,
                 &mut LocalSource(&files[chunk.segment]),
                 task.chunk_index,
@@ -786,7 +814,7 @@ impl E01Reader {
                 cache,
                 true,
             ),
-            ChunkStore::Cached { cache: c, runtime } => task.worker.read_chunk(
+            ChunkStore::Cached { cache: c, runtime } => worker.read_chunk(
                 chunk,
                 &mut CacheWorkerSource {
                     cache: c.as_ref(),
@@ -801,9 +829,14 @@ impl E01Reader {
                 cache,
                 true,
             ),
-        }
-        .map_err(ReadError::from)
-        .map_err(|e| e.with_path(&self.segment_paths[chunk.segment]))
+        };
+
+        // Back to the pool even if the chunk failed, or a bad image would
+        // drain it.
+        self.worker_pool.give_back(worker);
+        result
+            .map_err(ReadError::from)
+            .map_err(|e| e.with_path(&self.segment_paths[chunk.segment]))
     }
 }
 
@@ -1073,7 +1106,7 @@ impl E01Reader {
             stored_sha1: meta.sha1,
             segment_paths: meta.segment_paths.into_iter().map(PathBuf::from).collect(),
             corrupt_chunk_policy: options.corrupt_chunk_policy,
-            worker_pool: Mutex::new(vec![]),
+            worker_pool: WorkerPool::new(),
             store,
             decoded_chunk_cache: options
                 .decoded_chunk_cache
@@ -1122,11 +1155,7 @@ impl E01Reader {
         let foyer_trace = (tracing && matches!(self.store, ChunkStore::Cached { .. }))
             .then(|| Mutex::new(ReadTrace::default()));
 
-        // TODO: worker count still scales with the number of chunks in the read.
-        let mut workers = self.checkout_workers(end_chunk_index - beg_chunk_index);
-
         let mut tasks = Vec::with_capacity(end_chunk_index - beg_chunk_index);
-        let mut w = &mut workers[..];
 
         while offset < buf_end {
             // get the next chunk
@@ -1144,15 +1173,11 @@ impl E01Reader {
             let (bleft, bright) = buf.split_at_mut((end_in_buf - beg_in_buf) as usize);
             buf = bright;
 
-            let (wleft, wright) = w.split_at_mut(1);
-            w = wright;
-
             tasks.push(ChunkTask {
                 chunk_index,
                 buf: bleft,
                 beg_in_chunk,
                 end_in_chunk,
-                worker: &mut wleft[0],
             });
 
             offset += end_in_buf - beg_in_buf;
@@ -1163,18 +1188,14 @@ impl E01Reader {
 
         let trace = foyer_trace.as_ref();
         let run = |task| self.read_task(task, trace);
-        let result = if fan_out {
+        if fan_out {
             match &self.chunk_pool {
                 Some(pool) => pool.install(|| tasks.into_par_iter().try_for_each(run)),
                 None => tasks.into_par_iter().try_for_each(run),
             }
         } else {
             tasks.into_iter().try_for_each(run)
-        };
-
-        // Back to the pool even if a chunk failed, or a bad image would drain it.
-        self.return_workers(workers);
-        result?;
+        }?;
 
         let read_len = (offset - buf_beg) as usize;
         if let Some(log) = &self.io_log {

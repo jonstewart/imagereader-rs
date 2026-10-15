@@ -150,4 +150,56 @@ mod test {
     fn test_bad_chunk_e01_zero_bad_chunks() {
         assert_eq_test_data(&BAD_CHUNK_E01_ZEROED, &error_zero());
     }
+
+    /// Every way of carving the image into reads -- sizes that split chunks,
+    /// span several, and fan out over the decompression pool -- must produce
+    /// the same bytes as one whole-image read, with and without the
+    /// decoded-chunk cache and the fan-out.
+    #[test]
+    fn read_sizes_and_strategies_agree() {
+        for path in [IMAGE_E01.segment_paths[0], MIMAGE_E01.segment_paths[0]] {
+            let reference = {
+                let reader = E01Reader::open_glob(path, &error_error()).unwrap();
+                let mut all = vec![0u8; reader.image_size as usize];
+                assert_eq!(reader.read_at_offset(0, &mut all).unwrap(), all.len());
+                all
+            };
+
+            for (cache, fan_out) in [(true, true), (false, true), (true, false), (false, false)] {
+                let options = E01ReaderOptions {
+                    decoded_chunk_cache: cache,
+                    parallel_chunk_reads: fan_out,
+                    ..error_error()
+                };
+                let reader = E01Reader::open_glob(path, &options).unwrap();
+                // single bytes, sampled: a byte at a time over the whole image
+                // is a chunk decode per byte without the cache
+                for off in (0..reference.len()).step_by(4093) {
+                    let mut b = [0u8; 1];
+                    assert_eq!(reader.read_at_offset(off as u64, &mut b).unwrap(), 1);
+                    assert_eq!(b[0], reference[off], "{path}: byte {off}");
+                }
+                for size in [511, 4096, 32768, 32769, 65536 + 17, 300_000] {
+                    let mut buf = vec![0u8; size];
+                    // an unaligned start, then contiguous reads to the end
+                    let mut off = 7u64;
+                    while (off as usize) < reference.len() {
+                        let n = reader.read_at_offset(off, &mut buf).unwrap();
+                        assert!(n > 0);
+                        assert_eq!(
+                            &buf[..n],
+                            &reference[off as usize..off as usize + n],
+                            "{path}: size {size} at {off}, cache {cache}, fan-out {fan_out}"
+                        );
+                        off += n as u64;
+                    }
+                }
+                // reads at and past the end, and of nothing
+                let end = reader.image_size;
+                assert_eq!(reader.read_at_offset(end, &mut [0u8; 16]).unwrap(), 0);
+                assert!(reader.read_at_offset(end + 1, &mut [0u8; 16]).is_err());
+                assert_eq!(reader.read_at_offset(3, &mut []).unwrap(), 0);
+            }
+        }
+    }
 }

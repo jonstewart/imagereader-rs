@@ -104,6 +104,15 @@ impl Seek for CacheReadSeek {
 
         Ok(self.pos)
     }
+
+    /// Without this, `stream_position` falls back to `seek(Current(0))`,
+    /// which asks the cache for the source's end -- a lock and a refcount
+    /// round trip. Kaitai calls it before *every* primitive read (through
+    /// `BufReader`, which forwards it here), so on a segment with tens of
+    /// thousands of table entries that was most of the cost of opening.
+    fn stream_position(&mut self) -> Result<u64, std::io::Error> {
+        Ok(self.pos)
+    }
 }
 
 #[cfg(test)]

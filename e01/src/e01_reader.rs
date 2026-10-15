@@ -247,7 +247,8 @@ fn read_segment<T: AsRef<str>>(
             Section::Table {
                 entries,
                 base_offset,
-            } if !entries.is_empty() => tables.push((entries, base_offset, end_of_sectors)),
+                end,
+            } if !entries.is_empty() => tables.push((entries, base_offset, end, end_of_sectors)),
             Section::Sectors(eos) => end_of_sectors = eos,
             Section::Hash(h) => md5 = Some(h),
             Section::Digest(d_md5, d_sha1) => {
@@ -267,13 +268,12 @@ fn read_segment<T: AsRef<str>>(
     }
 
     let mut chunks = Vec::with_capacity(tables.iter().map(|t| t.0.len() / 4).sum());
-    for (entries, base_offset, end_of_sectors) in tables {
+    for (entries, base_offset, end, end_of_sectors) in tables {
         table_chunks(&entries, base_offset, segment_index, &mut chunks)
             .map_err(OpenError::from)
             .map_err(|e| e.with_path(&segment_path))?;
-        // the table does not record where its last chunk ends
         let last = chunks.last_mut().expect("a non-empty table adds chunks");
-        last.end_offset = end_of_sectors;
+        last.end_offset = last_chunk_end(last.data_offset, end_of_sectors, end);
     }
 
     Ok(SegmentComponents {
@@ -285,6 +285,22 @@ fn read_segment<T: AsRef<str>>(
         chunks,
         done,
     })
+}
+
+/// Where the last chunk of a table ends, which the table does not record.
+///
+/// Normally a table's chunks sit in the `sectors` section before it, so the
+/// last one ends where that section does. In EnCase 1 images there are no
+/// `sectors` sections: the chunks follow the offsets inside the table section
+/// itself, and the last one ends with it. Taking the end of a `sectors`
+/// section regardless gave such a chunk an end of zero, before its start, and
+/// every read of it failed.
+fn last_chunk_end(data_offset: u64, end_of_sectors: u64, table_end: u64) -> u64 {
+    if data_offset < end_of_sectors || data_offset >= table_end {
+        end_of_sectors
+    } else {
+        table_end
+    }
 }
 
 fn make_bytes_reader(
@@ -1352,6 +1368,81 @@ mod test {
             total_sector_count: 64,
         };
         assert!(validate_volume(&volume).is_ok());
+    }
+
+    #[test]
+    fn last_chunk_ends_with_its_sectors_section() {
+        // sectors section [0x100, 0x9000), table after it
+        assert_eq!(last_chunk_end(0x8000, 0x9000, 0x9500), 0x9000);
+    }
+
+    #[test]
+    fn last_chunk_inside_the_table_section_ends_with_it() {
+        // no sectors section; the chunk data follows the offsets in the table
+        assert_eq!(last_chunk_end(0x2000, 0, 0x9500), 0x9500);
+    }
+
+    #[test]
+    fn last_chunk_past_both_keeps_bounds_that_fail_the_read() {
+        // neither section contains the chunk: leave it inverted, which a read
+        // rejects as corrupt bounds rather than guessing a length
+        assert!(last_chunk_end(0xa000, 0x9000, 0x9500) < 0xa000);
+    }
+
+    /// A section descriptor: 16-byte type, next offset, size, padding and
+    /// an unchecked checksum, 76 bytes in all.
+    fn section_desc(section_type: &str, next_offset: usize, size: usize) -> Vec<u8> {
+        let mut b = vec![0u8; 76];
+        b[..section_type.len()].copy_from_slice(section_type.as_bytes());
+        b[16..24].copy_from_slice(&(next_offset as u64).to_le_bytes());
+        b[24..32].copy_from_slice(&(size as u64).to_le_bytes());
+        b
+    }
+
+    /// EnCase 1 segments have no `sectors` section: a table section holds
+    /// its offsets and then the chunks themselves. The table does not record
+    /// where its last chunk ends; here that is the end of the table section.
+    #[test]
+    fn last_chunk_of_a_table_holding_its_chunks_ends_with_the_table() {
+        let n = 3;
+        let chunk_len = 64;
+        let table_off = 13; // just past the file header
+        let entries_off = table_off + 76 + 24;
+        let data_off = entries_off + 4 * n + 4;
+        let table_end = data_off + n * chunk_len;
+
+        // file header: signature, then segment number 1
+        let mut seg = b"EVF\x09\x0d\x0a\xff\x00\x01\x01\x00\x00\x00".to_vec();
+        seg.extend(section_desc("table", table_end, table_end - table_off));
+        let mut header = vec![];
+        header.extend((n as u32).to_le_bytes()); // entry count
+        header.extend([0u8; 4]);
+        header.extend(0u64.to_le_bytes()); // base offset
+        header.extend([0u8; 4]);
+        header.extend(crate::sec_read::adler32(&header).to_le_bytes());
+        seg.extend(header);
+        let entries: Vec<u8> = (0..n)
+            .flat_map(|i| ((data_off + i * chunk_len) as u32).to_le_bytes())
+            .collect();
+        seg.extend(&entries);
+        seg.extend(crate::sec_read::adler32(&entries).to_le_bytes());
+        seg.extend(vec![0u8; n * chunk_len]);
+        seg.extend(section_desc("done", table_end, 76));
+
+        let segment = read_segment("encase1.E01", 0, &BytesReader::from(seg), false).unwrap();
+        let bounds: Vec<_> = segment
+            .chunks
+            .iter()
+            .map(|c| (c.data_offset as usize, c.end_offset as usize))
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                (data_off, data_off + chunk_len),
+                (data_off + chunk_len, data_off + 2 * chunk_len),
+                (data_off + 2 * chunk_len, table_end),
+            ]
+        );
     }
 
     #[test]

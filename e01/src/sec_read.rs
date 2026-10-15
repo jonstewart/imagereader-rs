@@ -20,10 +20,12 @@ pub struct Chunk {
 pub enum Section {
     Volume(VolumeSection),
     /// A table: its raw, checksum-verified offset array (see
-    /// [`table_chunks`]) and its base offset.
+    /// [`table_chunks`]), its base offset, and the offset just past the table
+    /// section.
     Table {
         entries: Vec<u8>,
         base_offset: u64,
+        end: u64,
     },
     Sectors(u64),
     Hash([u8; 16]),
@@ -58,6 +60,7 @@ fn checksum_ok(
 }
 
 fn read_section(io: &BytesReader, ignore_checksums: bool) -> Result<(usize, Section), LibError> {
+    let start = io.pos() as u64;
     let sd = EwfSectionDescriptorV1::read_into::<_, EwfSectionDescriptorV1>(io, None, None)
         .map_err(|e| LibError::DeserializationFailed("EwfSectionDescriptorV1", e))?;
 
@@ -80,6 +83,7 @@ fn read_section(io: &BytesReader, ignore_checksums: bool) -> Result<(usize, Sect
             Section::Table {
                 entries,
                 base_offset,
+                end: start + (*sd.size()).max(0x4c),
             }
         }
         "sectors" => Section::Sectors(io.pos() as u64 + section_size),

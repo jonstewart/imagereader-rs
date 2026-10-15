@@ -143,6 +143,7 @@ unsafe fn rust_options(
         parallel_chunk_reads: true,
         parallel_chunk_threads: e01_reader::DEFAULT_PARALLEL_CHUNK_THREADS,
         decoded_chunk_cache: true,
+        direct_file_io: true,
     })
 }
 

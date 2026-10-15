@@ -38,8 +38,10 @@ impl FileSource {
     }
 }
 
+/// Fill `buf` from `offset` with a positioned read, which neither moves nor
+/// depends on the file cursor, so one handle can serve concurrent readers.
 #[cfg(unix)]
-fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<(), Error> {
+pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<(), Error> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
 }
@@ -47,7 +49,11 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> Result<()
 /// Windows has no `read_exact_at`. `seek_read` is positioned but may come back
 /// short, so fill the buffer the way the unix version does.
 #[cfg(windows)]
-fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> Result<(), Error> {
+pub fn read_exact_at(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> Result<(), Error> {
     use std::io::ErrorKind;
     use std::os::windows::fs::FileExt;
 

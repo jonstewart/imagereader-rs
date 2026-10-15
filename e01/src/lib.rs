@@ -13,6 +13,7 @@ mod cacheworkersource;
 mod error;
 mod generated;
 pub mod hasher;
+mod localsource;
 mod readworker;
 mod sec_read;
 mod seg_path;
@@ -99,6 +100,7 @@ mod test {
             parallel_chunk_reads: true,
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
+            direct_file_io: true,
         }
     }
 
@@ -117,6 +119,7 @@ mod test {
             parallel_chunk_reads: true,
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
+            direct_file_io: true,
         }
     }
 
@@ -149,6 +152,36 @@ mod test {
     #[test]
     fn test_bad_chunk_e01_zero_bad_chunks() {
         assert_eq_test_data(&BAD_CHUNK_E01_ZEROED, &error_zero());
+    }
+
+    /// Local files are read directly by default; the same images must read
+    /// identically through the block cache, which is what S3 segments use.
+    fn through_block_cache(options: E01ReaderOptions) -> E01ReaderOptions {
+        E01ReaderOptions {
+            direct_file_io: false,
+            ..options
+        }
+    }
+
+    #[test]
+    fn test_image_e01_through_block_cache() {
+        assert_eq_test_data(&IMAGE_E01, &through_block_cache(error_error()));
+    }
+
+    #[test]
+    fn test_mimage_e01_through_block_cache() {
+        assert_eq_test_data(&MIMAGE_E01, &through_block_cache(error_error()));
+    }
+
+    #[test]
+    fn test_bad_chunk_e01_zero_bad_chunks_through_block_cache() {
+        assert_eq_test_data(&BAD_CHUNK_E01_ZEROED, &through_block_cache(error_zero()));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_bad_chunk_e01_through_block_cache() {
+        assert_eq_test_data(&BAD_CHUNK_E01, &through_block_cache(error_error()));
     }
 
     /// Every way of carving the image into reads -- sizes that split chunks,

@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use std::{
     collections::HashMap,
     fmt::Debug,
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
 };
@@ -12,6 +13,7 @@ use tracing::{debug, warn};
 use crate::{
     cacheworkersource::CacheWorkerSource,
     error::{IoError, LibError},
+    localsource::{FileReadSeek, LocalSource},
     readworker::{DecodedChunkCache, ReadWorker},
     sec_read::{Chunk, Section, SectionIterator, VolumeSection, table_chunks},
     seg_path::{SegPathError, UnrecognizedExtension, validated_segment_paths},
@@ -334,6 +336,22 @@ fn make_bytes_reader(
         .map_err(|e| e.with_path(p))
 }
 
+/// Buffer for parsing a local segment's sections. Small on purpose: the
+/// parser seeks from section to section, and each seek throws the buffer away.
+/// A table's offset array is read in one go and bypasses it.
+const LOCAL_PARSE_BUFFER: usize = 8 * 1024;
+
+fn make_local_bytes_reader(file: Arc<File>, p: &str) -> Result<BytesReader, OpenError> {
+    let rs = FileReadSeek::new(file)
+        .map_err(OpenError::from)
+        .map_err(|e| e.with_path(p))?;
+    let buffered = std::io::BufReader::with_capacity(LOCAL_PARSE_BUFFER, rs);
+
+    BytesReader::try_from(Box::new(buffered) as Box<dyn ReadSeek>)
+        .map_err(OpenError::from)
+        .map_err(|e| e.with_path(p))
+}
+
 struct E01Metadata {
     volume: VolumeSection,
     md5: Option<[u8; 16]>,
@@ -576,6 +594,16 @@ pub struct E01ReaderOptions {
     /// per chunk, for a lookup that never comes.
     pub decoded_chunk_cache: bool,
 
+    /// Read segments that are local files directly, with positioned reads,
+    /// instead of through the foyer block cache.
+    ///
+    /// The OS page cache already caches a local file, so the block cache only
+    /// adds work: a tokio `block_on` per chunk, and a whole block copied out of
+    /// the page cache for every 32 KiB chunk. With this on (the default) the
+    /// cache options apply only to segments that are not local files, and
+    /// opening an all-local image starts no tokio runtime and builds no cache.
+    pub direct_file_io: bool,
+
     /// Decompress a multi-chunk read's chunks in parallel, over rayon.
     ///
     /// With [`DEFAULT_PARALLEL_CHUNK_THREADS`], a whole-image verify of a 28 GiB
@@ -602,8 +630,21 @@ impl Default for E01ReaderOptions {
             parallel_chunk_reads: true,
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
+            direct_file_io: true,
         }
     }
+}
+
+/// Where chunk bytes come from.
+enum ChunkStore {
+    /// Local segment files, read directly; see `localsource`.
+    Local(Vec<Arc<File>>),
+    /// Segments read through the foyer block cache: S3, or local files with
+    /// `direct_file_io` off.
+    Cached {
+        cache: Arc<dyn Cache>,
+        runtime: Arc<Runtime>,
+    },
 }
 
 pub struct E01Reader {
@@ -634,12 +675,11 @@ pub struct E01Reader {
     /// so pooling them costs a little memory per concurrent read and nothing
     /// else. The lock is held only to pop and push, never across a read.
     worker_pool: Mutex<Vec<ReadWorker>>,
-    cache: Arc<dyn Cache>,
+    store: ChunkStore,
     /// `None` disables the decoded-chunk cache entirely -- there is then no
     /// lock to take and no chunk to insert, rather than a cache that is merely
     /// never asked for anything.
-    decoded_chunk_cache: Option<Arc<DecodedChunkCache>>,
-    runtime: Arc<Runtime>,
+    decoded_chunk_cache: Option<DecodedChunkCache>,
     io_log: Option<Arc<IoLog>>,
     parallel_chunk_reads: bool,
     /// `None` uses rayon's global pool.
@@ -648,20 +688,15 @@ pub struct E01Reader {
 
 const DECODED_CHUNK_CACHE_CHUNKS: usize = 1024;
 
-/// One chunk's worth of work: which chunk, where to read it from, and where its
-/// bytes go in the caller's buffer.
-#[allow(clippy::type_complexity)]
-type ChunkTask<'a> = (
-    usize,
-    &'a Chunk,
-    CacheWorkerSource,
-    Option<Arc<DecodedChunkCache>>,
-    &'a mut [u8],
-    usize,
-    usize,
-    &'a Path,
-    &'a mut ReadWorker,
-);
+/// One chunk's worth of a read: which chunk, which part of it, where in the
+/// caller's buffer it goes, and the worker to decode it with.
+struct ChunkTask<'a> {
+    chunk_index: usize,
+    buf: &'a mut [u8],
+    beg_in_chunk: usize,
+    end_in_chunk: usize,
+    worker: &'a mut ReadWorker,
+}
 
 /// Threads this process may actually use.
 ///
@@ -730,34 +765,46 @@ impl E01Reader {
             .expect("worker pool poisoned")
             .extend(workers);
     }
-}
 
-fn run_chunk_task(task: ChunkTask<'_>) -> Result<(), ReadError> {
-    let (
-        chunk_index,
-        chunk,
-        mut src,
-        decoded_chunk_cache,
-        sbuf,
-        beg_in_chunk,
-        end_in_chunk,
-        seg_path,
-        worker,
-    ) = task;
+    /// Read one chunk's part of a read.
+    fn read_task(
+        &self,
+        task: ChunkTask<'_>,
+        foyer_trace: Option<&Mutex<ReadTrace>>,
+    ) -> Result<(), ReadError> {
+        let chunk = &self.chunks[task.chunk_index];
+        let cache = self.decoded_chunk_cache.as_ref();
 
-    worker
-        .read_chunk(
-            chunk,
-            &mut src,
-            chunk_index,
-            sbuf,
-            beg_in_chunk,
-            end_in_chunk,
-            decoded_chunk_cache.as_deref(),
-            true,
-        )
+        match &self.store {
+            ChunkStore::Local(files) => task.worker.read_chunk(
+                chunk,
+                &mut LocalSource(&files[chunk.segment]),
+                task.chunk_index,
+                task.buf,
+                task.beg_in_chunk,
+                task.end_in_chunk,
+                cache,
+                true,
+            ),
+            ChunkStore::Cached { cache: c, runtime } => task.worker.read_chunk(
+                chunk,
+                &mut CacheWorkerSource {
+                    cache: c.as_ref(),
+                    runtime,
+                    idx: chunk.segment,
+                    foyer_trace,
+                },
+                task.chunk_index,
+                task.buf,
+                task.beg_in_chunk,
+                task.end_in_chunk,
+                cache,
+                true,
+            ),
+        }
         .map_err(ReadError::from)
-        .map_err(|e| e.with_path(seg_path))
+        .map_err(|e| e.with_path(&self.segment_paths[chunk.segment]))
+    }
 }
 
 impl Debug for E01Reader {
@@ -777,6 +824,12 @@ impl Debug for E01Reader {
     }
 }
 
+fn new_runtime() -> Result<Arc<Runtime>, OpenError> {
+    Ok(Arc::new(
+        tokio::runtime::Runtime::new().map_err(InitError::TokioRuntimeFailed)?,
+    ))
+}
+
 impl E01Reader {
     pub fn open_glob<T: AsRef<str>>(
         example_segment_path: T,
@@ -785,17 +838,15 @@ impl E01Reader {
         let url = path_or_url_to_url(&example_segment_path)
             .ok_or(OpenError::BadPath(example_segment_path.as_ref().into()))?;
 
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().map_err(InitError::TokioRuntimeFailed)?);
-
         match url.scheme() {
             "file" => Self::open_impl(
                 validated_segment_paths(example_segment_path, FileChecker)?,
                 options,
-                runtime,
+                None,
                 None,
             ),
             "s3" => {
+                let runtime = new_runtime()?;
                 let s3_auth = resolve_s3_auth(&runtime).map_err(OpenError::from)?;
                 let auth = Arc::new(s3_auth);
                 Self::open_impl(
@@ -804,7 +855,7 @@ impl E01Reader {
                         S3Checker::new(&url, runtime.clone(), auth.clone())?,
                     )?,
                     options,
-                    runtime,
+                    Some(runtime),
                     Some(auth),
                 )
             }
@@ -816,36 +867,61 @@ impl E01Reader {
         segment_paths: T,
         options: &E01ReaderOptions,
     ) -> Result<Self, OpenError> {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().map_err(InitError::TokioRuntimeFailed)?);
-
         let paths: Vec<String> = segment_paths
             .into_iter()
             .map(|p| p.as_ref().to_string())
             .collect();
-        let s3_auth = if paths.iter().any(|p| p.starts_with("s3://")) {
-            Some(Arc::new(
-                resolve_s3_auth(&runtime).map_err(OpenError::from)?,
-            ))
+        let (runtime, s3_auth) = if paths.iter().any(|p| p.starts_with("s3://")) {
+            let runtime = new_runtime()?;
+            let auth = resolve_s3_auth(&runtime).map_err(OpenError::from)?;
+            (Some(runtime), Some(Arc::new(auth)))
         } else {
-            None
+            (None, None)
         };
 
         Self::open_impl(paths, options, runtime, s3_auth)
     }
 
-    fn open_impl<T: IntoIterator<Item: AsRef<str>>>(
-        segment_paths: T,
+    /// The segment files themselves, when every segment is a local file and
+    /// direct I/O is on; `None` means go through the block cache.
+    fn local_segment_files(
+        segment_paths: &[String],
         options: &E01ReaderOptions,
-        runtime: Arc<Runtime>,
-        s3_auth: Option<Arc<S3Auth>>,
-    ) -> Result<Self, OpenError> {
-        let mut sp_itr = segment_paths.into_iter().peekable();
-
-        if sp_itr.peek().is_none() {
-            return Err(OpenError::NoSegmentFiles);
+    ) -> Result<Option<Vec<Arc<File>>>, OpenError> {
+        if !options.direct_file_io {
+            return Ok(None);
         }
 
+        let mut file_paths = Vec::with_capacity(segment_paths.len());
+        for p in segment_paths {
+            let url = path_or_url_to_url(p).ok_or(OpenError::BadPath(p.clone()))?;
+            if url.scheme() != "file" {
+                return Ok(None);
+            }
+            file_paths.push(
+                url.to_file_path()
+                    .map_err(|_| OpenError::BadPath(p.clone()))?,
+            );
+        }
+
+        segment_paths
+            .iter()
+            .zip(file_paths)
+            .map(|(p, fp)| {
+                File::open(fp)
+                    .map(Arc::new)
+                    .map_err(|e| OpenError::Source(imagesource::OpenError::from(e).with_path(p)))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// Build the block cache that segments are read through when they are not
+    /// read directly.
+    fn build_cache(
+        options: &E01ReaderOptions,
+        runtime: &Runtime,
+    ) -> Result<Arc<dyn Cache>, OpenError> {
         // Not clamped to 1: a zero here means "unset", and the cache's own
         // fallback is the 1 MiB default. `.max(1)` produced a *1-byte* block size
         // instead -- a memory budget of a billion entries, and one cache entry per
@@ -888,32 +964,82 @@ impl E01Reader {
                 .map_err(InitError::CacheSetupFailed)?,
         };
 
-        let cache: Arc<dyn Cache> = Arc::new(c.with_io_log(options.io_log.clone()));
+        Ok(Arc::new(c.with_io_log(options.io_log.clone())))
+    }
+
+    fn open_impl(
+        segment_paths: Vec<String>,
+        options: &E01ReaderOptions,
+        runtime: Option<Arc<Runtime>>,
+        s3_auth: Option<Arc<S3Auth>>,
+    ) -> Result<Self, OpenError> {
+        if segment_paths.is_empty() {
+            return Err(OpenError::NoSegmentFiles);
+        }
 
         let ignore_checksums =
             options.corrupt_section_policy == CorruptSectionPolicy::DamnTheTorpedoes;
 
-        let io_log = options.io_log.clone();
-
         // read the segment metadata
-        let segs = sp_itr
-            .map(|p| p.as_ref().to_string())
-            .collect::<Vec<_>>()
-            //            .into_iter()
-            .into_par_iter()
-            .enumerate()
-            .map(|(idx, sp)| {
-                let io = make_bytes_reader(
-                    &sp,
-                    idx,
-                    cache.clone(),
-                    runtime.clone(),
-                    s3_auth.as_ref(),
-                    io_log.clone(),
-                )?;
-                read_segment(sp, idx, &io, ignore_checksums)
-            })
-            .collect::<Result<Vec<SegmentComponents>, _>>()?;
+        let (segs, store) = match Self::local_segment_files(&segment_paths, options)? {
+            Some(files) => {
+                let read_one = |(idx, (sp, file)): (usize, (String, &Arc<File>))| {
+                    let io = make_local_bytes_reader(file.clone(), &sp)?;
+                    read_segment(sp, idx, &io, ignore_checksums)
+                };
+                let work: Vec<_> = segment_paths.into_iter().zip(&files).enumerate().collect();
+                // Parsing a local segment takes about a millisecond, so a
+                // thread each for a handful of them beats waking rayon's
+                // global pool, which spawns a thread per core the first time.
+                let segs =
+                    if work.len() == 1 {
+                        work.into_iter()
+                            .map(read_one)
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        std::thread::scope(|scope| {
+                            let per_thread = work.len().div_ceil(available_parallelism().min(8));
+                            let mut work = work.into_iter().peekable();
+                            let mut handles = vec![];
+                            while work.peek().is_some() {
+                                let mine: Vec<_> = work.by_ref().take(per_thread).collect();
+                                handles.push(scope.spawn(move || {
+                                    mine.into_iter().map(read_one).collect::<Vec<_>>()
+                                }));
+                            }
+                            handles
+                                .into_iter()
+                                .flat_map(|h| h.join().expect("segment parser panicked"))
+                                .collect::<Result<Vec<_>, _>>()
+                        })?
+                    };
+                (segs, ChunkStore::Local(files))
+            }
+            None => {
+                let runtime = match runtime {
+                    Some(r) => r,
+                    None => new_runtime()?,
+                };
+                let cache = Self::build_cache(options, &runtime)?;
+                let io_log = options.io_log.clone();
+                let segs = segment_paths
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(idx, sp)| {
+                        let io = make_bytes_reader(
+                            &sp,
+                            idx,
+                            cache.clone(),
+                            runtime.clone(),
+                            s3_auth.as_ref(),
+                            io_log.clone(),
+                        )?;
+                        read_segment(sp, idx, &io, ignore_checksums)
+                    })
+                    .collect::<Result<Vec<SegmentComponents>, _>>()?;
+                (segs, ChunkStore::Cached { cache, runtime })
+            }
+        };
 
         // process segment metadata
         let meta = process_segments(segs)?;
@@ -948,11 +1074,10 @@ impl E01Reader {
             segment_paths: meta.segment_paths.into_iter().map(PathBuf::from).collect(),
             corrupt_chunk_policy: options.corrupt_chunk_policy,
             worker_pool: Mutex::new(vec![]),
-            cache,
+            store,
             decoded_chunk_cache: options
                 .decoded_chunk_cache
-                .then(|| Arc::new(DecodedChunkCache::new(DECODED_CHUNK_CACHE_CHUNKS))),
-            runtime,
+                .then(|| DecodedChunkCache::new(DECODED_CHUNK_CACHE_CHUNKS)),
             io_log: options.io_log.clone(),
             parallel_chunk_reads: options.parallel_chunk_reads,
             chunk_pool: chunk_pool(options.parallel_chunk_threads)?,
@@ -993,7 +1118,9 @@ impl E01Reader {
             None
         };
 
-        let foyer_trace = tracing.then(|| Arc::new(Mutex::new(ReadTrace::default())));
+        // Only a read through the block cache has a foyer verdict to report.
+        let foyer_trace = (tracing && matches!(self.store, ChunkStore::Cached { .. }))
+            .then(|| Mutex::new(ReadTrace::default()));
 
         // TODO: worker count still scales with the number of chunks in the read.
         let mut workers = self.checkout_workers(end_chunk_index - beg_chunk_index);
@@ -1004,9 +1131,6 @@ impl E01Reader {
         while offset < buf_end {
             // get the next chunk
             let chunk_index = (offset / chunk_size) as usize;
-
-            let chunk = &self.chunks[chunk_index];
-            let seg_path = self.segment_paths[chunk.segment].as_path();
 
             let chunk_beg = chunk_index as u64 * chunk_size;
             let chunk_end = std::cmp::min(chunk_beg + chunk_size, image_end);
@@ -1023,24 +1147,13 @@ impl E01Reader {
             let (wleft, wright) = w.split_at_mut(1);
             w = wright;
 
-            let src = CacheWorkerSource {
-                cache: self.cache.clone(),
-                runtime: self.runtime.clone(),
-                idx: chunk.segment,
-                foyer_trace: foyer_trace.clone(),
-            };
-            let decoded_chunk_cache = self.decoded_chunk_cache.clone();
-            tasks.push((
+            tasks.push(ChunkTask {
                 chunk_index,
-                chunk,
-                src,
-                decoded_chunk_cache,
-                bleft,
+                buf: bleft,
                 beg_in_chunk,
                 end_in_chunk,
-                seg_path,
-                &mut wleft[0],
-            ));
+                worker: &mut wleft[0],
+            });
 
             offset += end_in_buf - beg_in_buf;
         }
@@ -1048,13 +1161,15 @@ impl E01Reader {
         // A single chunk is driven inline either way; there is nothing to fan out.
         let fan_out = self.parallel_chunk_reads && tasks.len() > 1;
 
+        let trace = foyer_trace.as_ref();
+        let run = |task| self.read_task(task, trace);
         let result = if fan_out {
             match &self.chunk_pool {
-                Some(pool) => pool.install(|| tasks.into_par_iter().try_for_each(run_chunk_task)),
-                None => tasks.into_par_iter().try_for_each(run_chunk_task),
+                Some(pool) => pool.install(|| tasks.into_par_iter().try_for_each(run)),
+                None => tasks.into_par_iter().try_for_each(run),
             }
         } else {
-            tasks.into_iter().try_for_each(run_chunk_task)
+            tasks.into_iter().try_for_each(run)
         };
 
         // Back to the pool even if a chunk failed, or a bad image would drain it.
@@ -1115,6 +1230,8 @@ mod test {
 
         let options = E01ReaderOptions {
             io_log: Some(io_log.clone()),
+            // the foyer verdict exists only on the block-cache path
+            direct_file_io: false,
             ..Default::default()
         };
         let reader =
@@ -1190,6 +1307,7 @@ mod test {
             parallel_chunk_reads: true,
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
+            direct_file_io: true,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1227,6 +1345,7 @@ mod test {
             parallel_chunk_reads: true,
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
+            direct_file_io: true,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1357,6 +1476,44 @@ mod test {
             total_sector_count: 64,
         };
         assert!(validate_volume(&volume).is_ok());
+    }
+
+    /// Read directly from a local file there is no block cache, so no foyer
+    /// verdict: the trace must say so rather than report a "hit" that never
+    /// happened. The decoded-chunk verdicts are unaffected.
+    #[test]
+    fn read_trace_on_direct_io_has_no_foyer_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("io.jsonl");
+        let io_log = IoLog::open(&log_path).unwrap();
+        io_log.begin_serving().unwrap();
+
+        let options = E01ReaderOptions {
+            io_log: Some(io_log.clone()),
+            ..Default::default()
+        };
+        assert!(options.direct_file_io);
+        let reader =
+            E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        reader.read_at_offset(0, &mut buf).unwrap();
+        reader.read_at_offset(0, &mut buf).unwrap();
+
+        drop(reader);
+        drop(io_log);
+
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let reads: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains(r#""kind":"read""#))
+            .collect();
+        assert_eq!(reads.len(), 2, "one record per read: {body}");
+        assert!(reads[0].contains(r#""chunk":"miss""#), "{}", reads[0]);
+        assert!(reads[1].contains(r#""chunk":"hit""#), "{}", reads[1]);
+        for r in reads {
+            assert!(r.contains(r#""foyer":"n/a""#), "{r}");
+        }
     }
 
     #[test]

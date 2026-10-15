@@ -522,6 +522,86 @@ mod tests {
         assert_eq!(src.read_count, 1);
     }
 
+    /// Read the whole of a compressed chunk whose stored bytes are `stored`,
+    /// with the Error policy, through both the cached and uncached paths.
+    fn read_compressed_strict(
+        stored: Vec<u8>,
+        chunk_size: usize,
+    ) -> [Result<(), ReadErrorKind>; 2] {
+        let chunk = Chunk {
+            segment: 0,
+            data_offset: 0,
+            end_offset: stored.len() as u64,
+            compressed: true,
+        };
+        let mut src = VecSource {
+            data: stored,
+            read_count: 0,
+        };
+        let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, CorruptChunkPolicy::Error);
+        let mut out = vec![0; chunk_size];
+        let uncached = worker.read(&chunk, &mut src, 0, &mut out, 0, chunk_size);
+        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cached = worker.read_cached(&chunk, &mut src, 0, &mut out, 0, chunk_size, &cache);
+        [uncached, cached]
+    }
+
+    /// A zlib stream ends with an adler32 of its decompressed bytes; it is the
+    /// only checksum a compressed EWF chunk has, and a chunk whose adler32
+    /// does not match must not be served as good data.
+    #[test]
+    fn compressed_chunk_with_bad_adler32_is_an_error() {
+        let chunk_size = 32768;
+        let data = (0..chunk_size)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut stored = compressed_chunk(&data);
+        let last = stored.len() - 1;
+        stored[last] ^= 0xff;
+
+        for r in read_compressed_strict(stored, chunk_size) {
+            assert!(
+                matches!(r, Err(ReadErrorKind::DecompressionFailed(..))),
+                "got {r:?}"
+            );
+        }
+    }
+
+    /// A stream cut off after the data but before its adler32 trailer has not
+    /// been verified at all, and must not pass as a good chunk.
+    #[test]
+    fn compressed_chunk_missing_its_trailer_is_an_error() {
+        let chunk_size = 32768;
+        let data = (0..chunk_size)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut stored = compressed_chunk(&data);
+        stored.truncate(stored.len() - 4);
+
+        for r in read_compressed_strict(stored, chunk_size) {
+            assert!(
+                matches!(r, Err(ReadErrorKind::DecompressionFailed(..))),
+                "got {r:?}"
+            );
+        }
+    }
+
+    /// A chunk that inflates to less than a chunk has no data for the rest of
+    /// the chunk, and inventing zeros for it would be silent.
+    #[test]
+    fn compressed_chunk_that_inflates_short_is_an_error() {
+        let chunk_size = 32768;
+        let data = vec![0x5a; chunk_size - 512];
+        let stored = compressed_chunk(&data);
+
+        for r in read_compressed_strict(stored, chunk_size) {
+            assert!(
+                matches!(r, Err(ReadErrorKind::DecompressionFailed(..))),
+                "got {r:?}"
+            );
+        }
+    }
+
     /// Chunk offsets come straight from the image's table sections; a corrupt
     /// table can put a chunk's end before its start. That must surface as a
     /// read error, not an arithmetic panic or a giant allocation.

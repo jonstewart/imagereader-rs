@@ -236,6 +236,22 @@ impl ReadWorker {
             }
         }
 
+        // A final chunk may be stored at full size, but every chunk must hold
+        // as much data as the image has left for it.
+        let chunk_beg = chunk_index as u64 * self.chunk_size as u64;
+        let decoded_len = (self.image_end - chunk_beg).min(self.chunk_size as u64) as usize;
+        if out.len() < decoded_len {
+            error!("chunk {chunk_index} is shorter than its data");
+            match self.corrupt_chunk_policy {
+                CorruptChunkPolicy::Error => {
+                    return Err(ReadErrorKind::TooShort(chunk_index, raw_data.len()));
+                }
+                CorruptChunkPolicy::Zero => out.fill(0),
+                CorruptChunkPolicy::RawIfPossible => {}
+            }
+            out.resize(decoded_len, 0);
+        }
+
         Ok(out)
     }
 
@@ -636,6 +652,60 @@ mod tests {
                 matches!(r, Err(ReadErrorKind::DecompressionFailed(..))),
                 "got {r:?}"
             );
+        }
+    }
+
+    /// Read the whole of an uncompressed chunk of `chunk_size` whose stored
+    /// bytes are `stored`, through both the cached and uncached paths.
+    fn read_uncompressed(
+        stored: Vec<u8>,
+        chunk_size: usize,
+        policy: CorruptChunkPolicy,
+    ) -> [(Result<(), ReadErrorKind>, Vec<u8>); 2] {
+        let chunk = Chunk {
+            segment: 0,
+            data_offset: 0,
+            end_offset: stored.len() as u64,
+            compressed: false,
+        };
+        let mut src = VecSource {
+            data: stored,
+            read_count: 0,
+        };
+        let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, policy);
+        let mut uncached = vec![0xff; chunk_size];
+        let r = worker.read(&chunk, &mut src, 0, &mut uncached, 0, chunk_size);
+        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let mut cached = vec![0xff; chunk_size];
+        let c = worker.read_cached(&chunk, &mut src, 0, &mut cached, 0, chunk_size, &cache);
+        [(r, uncached), (c, cached)]
+    }
+
+    /// An uncompressed chunk is its data and an adler32; one whose table entry
+    /// gives it fewer bytes than a chunk holds has no data for the rest of
+    /// the chunk. That is a corrupt chunk, not a slice index out of range.
+    #[test]
+    fn short_uncompressed_chunk_is_an_error_not_a_panic() {
+        let chunk_size = 32768;
+        let data = vec![0x5a; chunk_size - 512];
+        let stored = uncompressed_chunk_with_trailer(&data);
+
+        for (r, _) in read_uncompressed(stored, chunk_size, CorruptChunkPolicy::Error) {
+            assert!(matches!(r, Err(ReadErrorKind::TooShort(0, _))), "got {r:?}");
+        }
+    }
+
+    /// The zero policy zeroes a short uncompressed chunk like any other
+    /// corrupt one.
+    #[test]
+    fn short_uncompressed_chunk_is_zeroed_by_the_zero_policy() {
+        let chunk_size = 32768;
+        let data = vec![0x5a; chunk_size - 512];
+        let stored = uncompressed_chunk_with_trailer(&data);
+
+        for (r, out) in read_uncompressed(stored, chunk_size, CorruptChunkPolicy::Zero) {
+            r.unwrap();
+            assert!(out.iter().all(|&b| b == 0));
         }
     }
 

@@ -145,7 +145,7 @@ pub enum ReadErrorKind {
     OffsetBeyondEnd(u64, u64),
     #[error("{0}")]
     IoError(#[from] std::io::Error),
-    #[error("Chunk {0} is {1} bytes long, must be at least 5 bytes long")]
+    #[error("Chunk {0} is {1} bytes long, too short for its data and checksum")]
     TooShort(usize, usize),
     #[error("Chunk {0} checksum failed: calculated {1}, expected {2}")]
     BadChecksum(usize, u32, u32),

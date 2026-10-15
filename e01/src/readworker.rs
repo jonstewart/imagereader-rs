@@ -1,7 +1,8 @@
 use flate2::read::ZlibDecoder;
 use simd_adler32::read::adler32;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
     io::{Cursor, Read},
     sync::{Arc, Mutex},
 };
@@ -11,46 +12,146 @@ use crate::e01_reader::{CorruptChunkPolicy, ReadErrorKind};
 use crate::sec_read::Chunk;
 use crate::workersource::WorkerSource;
 
-#[derive(Debug)]
-pub struct DecodedChunkCache {
-    capacity: usize,
-    chunks: HashMap<usize, Arc<Vec<u8>>>,
-    lru: VecDeque<usize>,
-}
+/// Chunk indices are already well-distributed integers; SipHash on them is
+/// pure overhead on a lookup made for every chunk read.
+#[derive(Default)]
+struct ChunkIndexHasher(u64);
 
-impl DecodedChunkCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            chunks: HashMap::with_capacity(capacity),
-            lru: VecDeque::with_capacity(capacity),
+impl Hasher for ChunkIndexHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 << 8 | *b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         }
     }
 
-    pub fn get(&mut self, chunk_index: usize) -> Option<Arc<Vec<u8>>> {
-        let chunk = self.chunks.get(&chunk_index)?.clone();
-        self.lru.retain(|idx| *idx != chunk_index);
-        self.lru.push_back(chunk_index);
-        Some(chunk)
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+type ChunkIndexMap<V> = HashMap<usize, V, BuildHasherDefault<ChunkIndexHasher>>;
+
+struct Slot {
+    chunk_index: usize,
+    data: Arc<[u8]>,
+    referenced: bool,
+}
+
+/// One shard of the decoded-chunk cache, evicting by CLOCK (second chance):
+/// an approximation of LRU whose hits and inserts are O(1). The LRU it
+/// replaces kept recency in a `VecDeque` and paid a linear `retain` over the
+/// whole cache on every hit.
+struct Shard {
+    capacity: usize,
+    slots: Vec<Slot>,
+    index: ChunkIndexMap<usize>,
+    hand: usize,
+}
+
+impl Shard {
+    fn get(&mut self, chunk_index: usize) -> Option<Arc<[u8]>> {
+        let slot = &mut self.slots[*self.index.get(&chunk_index)?];
+        slot.referenced = true;
+        Some(slot.data.clone())
     }
 
-    pub fn insert(&mut self, chunk_index: usize, chunk: Arc<Vec<u8>>) {
-        if self.capacity == 0 {
+    fn insert(&mut self, chunk_index: usize, data: Arc<[u8]>) {
+        if let Some(&i) = self.index.get(&chunk_index) {
+            self.slots[i].data = data;
+            self.slots[i].referenced = true;
             return;
         }
 
-        if self.chunks.insert(chunk_index, chunk).is_some() {
-            self.lru.retain(|idx| *idx != chunk_index);
+        if self.slots.len() < self.capacity {
+            self.index.insert(chunk_index, self.slots.len());
+            self.slots.push(Slot {
+                chunk_index,
+                data,
+                referenced: false,
+            });
+            return;
         }
-        self.lru.push_back(chunk_index);
 
-        while self.chunks.len() > self.capacity {
-            let Some(evicted) = self.lru.pop_front() else {
-                break;
-            };
-            if self.chunks.remove(&evicted).is_none() {
+        // Sweep for a slot not touched since the hand last passed it.
+        loop {
+            let slot = &mut self.slots[self.hand];
+            if slot.referenced {
+                slot.referenced = false;
+                self.hand = (self.hand + 1) % self.capacity;
                 continue;
             }
+            self.index.remove(&slot.chunk_index);
+            self.index.insert(chunk_index, self.hand);
+            *slot = Slot {
+                chunk_index,
+                data,
+                referenced: false,
+            };
+            self.hand = (self.hand + 1) % self.capacity;
+            return;
+        }
+    }
+}
+
+/// A bounded cache of decompressed chunks, for clients that read a chunk more
+/// than once -- a filesystem issuing 4 KiB reads inside a 32 KiB chunk.
+///
+/// Sharded by chunk index so concurrent readers rarely meet on a lock, where a
+/// single cache-wide mutex serialized every chunk read of every thread.
+pub struct DecodedChunkCache {
+    shards: Box<[Mutex<Shard>]>,
+}
+
+impl std::fmt::Debug for DecodedChunkCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedChunkCache")
+            .field("shards", &self.shards.len())
+            .finish()
+    }
+}
+
+const MAX_CACHE_SHARDS: usize = 16;
+
+impl DecodedChunkCache {
+    /// Holds about `capacity` chunks; a capacity of zero caches nothing.
+    pub fn new(capacity: usize) -> Self {
+        let shard_count = capacity.clamp(1, MAX_CACHE_SHARDS);
+        let per_shard = capacity.div_ceil(shard_count);
+        let shards = (0..shard_count)
+            .map(|_| {
+                Mutex::new(Shard {
+                    capacity: per_shard,
+                    slots: Vec::with_capacity(per_shard),
+                    index: ChunkIndexMap::default(),
+                    hand: 0,
+                })
+            })
+            .collect();
+        Self { shards }
+    }
+
+    fn shard(&self, chunk_index: usize) -> &Mutex<Shard> {
+        &self.shards[chunk_index % self.shards.len()]
+    }
+
+    pub fn get(&self, chunk_index: usize) -> Option<Arc<[u8]>> {
+        self.shard(chunk_index)
+            .lock()
+            .expect("decoded chunk cache poisoned")
+            .get(chunk_index)
+    }
+
+    pub fn insert(&self, chunk_index: usize, chunk: Arc<[u8]>) {
+        let mut shard = self
+            .shard(chunk_index)
+            .lock()
+            .expect("decoded chunk cache poisoned");
+        if shard.capacity > 0 {
+            shard.insert(chunk_index, chunk);
         }
     }
 }
@@ -285,9 +386,9 @@ impl ReadWorker {
         buf: &mut [u8],
         beg_in_chunk: usize,
         end_in_chunk: usize,
-        cache: &Mutex<DecodedChunkCache>,
+        cache: &DecodedChunkCache,
     ) -> Result<(), ReadErrorKind> {
-        if let Some(chunk) = cache.lock().unwrap().get(chunk_index) {
+        if let Some(chunk) = cache.get(chunk_index) {
             buf.copy_from_slice(&chunk[beg_in_chunk..end_in_chunk]);
             return Ok(());
         }
@@ -298,7 +399,7 @@ impl ReadWorker {
 
         let payload = self.verify_uncompressed_payload(chunk_index, &raw_data)?;
         buf.copy_from_slice(&payload[beg_in_chunk..end_in_chunk]);
-        cache.lock().unwrap().insert(chunk_index, Arc::new(payload));
+        cache.insert(chunk_index, Arc::from(payload));
 
         Ok(())
     }
@@ -313,9 +414,9 @@ impl ReadWorker {
         buf: &mut [u8],
         beg_in_chunk: usize,
         end_in_chunk: usize,
-        cache: &Mutex<DecodedChunkCache>,
+        cache: &DecodedChunkCache,
     ) -> Result<(), ReadErrorKind> {
-        if let Some(chunk) = cache.lock().unwrap().get(chunk_index) {
+        if let Some(chunk) = cache.get(chunk_index) {
             buf.copy_from_slice(&chunk[beg_in_chunk..end_in_chunk]);
             return Ok(());
         }
@@ -328,7 +429,7 @@ impl ReadWorker {
         self.read_compressed_decompress_full(chunk_index, &mut decoded)?;
 
         buf.copy_from_slice(&decoded[beg_in_chunk..end_in_chunk]);
-        cache.lock().unwrap().insert(chunk_index, Arc::new(decoded));
+        cache.insert(chunk_index, Arc::from(decoded));
 
         Ok(())
     }
@@ -358,7 +459,7 @@ impl ReadWorker {
         buf: &mut [u8],
         beg_in_chunk: usize,
         end_in_chunk: usize,
-        cache: &Mutex<DecodedChunkCache>,
+        cache: &DecodedChunkCache,
     ) -> Result<(), ReadErrorKind> {
         let chunk_len = self.checked_chunk_len(chunk, chunk_index)?;
         let chunk_off = chunk.data_offset;
@@ -507,7 +608,7 @@ mod tests {
             read_count: 0,
         };
         let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, CorruptChunkPolicy::Error);
-        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cache = DecodedChunkCache::new(8);
 
         let mut first = vec![0; 4096];
         worker
@@ -542,7 +643,7 @@ mod tests {
             read_count: 0,
         };
         let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, CorruptChunkPolicy::Error);
-        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cache = DecodedChunkCache::new(8);
 
         let mut first = vec![0; 4096];
         worker
@@ -557,6 +658,42 @@ mod tests {
             .unwrap();
         assert_eq!(&second, &data[4096..8192]);
         assert_eq!(src.read_count, 1);
+    }
+
+    #[test]
+    fn decoded_chunk_cache_holds_at_most_its_capacity() {
+        let cache = DecodedChunkCache::new(32);
+        for i in 0..1000usize {
+            cache.insert(i, Arc::from(vec![i as u8; 4]));
+        }
+        let held: Vec<_> = (0..1000).filter_map(|i| Some((i, cache.get(i)?))).collect();
+        assert!(!held.is_empty() && held.len() <= 32, "{} held", held.len());
+        for (i, data) in held {
+            assert_eq!(&data[..], &[i as u8; 4]);
+        }
+    }
+
+    /// CLOCK gives a chunk used since the hand last passed it a second
+    /// chance: the sweep evicts one that has not been.
+    #[test]
+    fn decoded_chunk_cache_evicts_an_unused_chunk_before_a_used_one() {
+        // 16 shards of 2; chunks 0, 16 and 32 share a shard
+        let cache = DecodedChunkCache::new(32);
+        cache.insert(0, Arc::from(vec![0u8]));
+        cache.insert(16, Arc::from(vec![16u8]));
+        assert!(cache.get(0).is_some());
+        cache.insert(32, Arc::from(vec![32u8]));
+
+        assert!(cache.get(0).is_some());
+        assert!(cache.get(16).is_none());
+        assert!(cache.get(32).is_some());
+    }
+
+    #[test]
+    fn decoded_chunk_cache_of_no_capacity_holds_nothing() {
+        let cache = DecodedChunkCache::new(0);
+        cache.insert(0, Arc::from(vec![0u8]));
+        assert!(cache.get(0).is_none());
     }
 
     /// Read the whole of a compressed chunk whose stored bytes are `stored`,
@@ -578,7 +715,7 @@ mod tests {
         let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, CorruptChunkPolicy::Error);
         let mut out = vec![0; chunk_size];
         let uncached = worker.read(&chunk, &mut src, 0, &mut out, 0, chunk_size);
-        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cache = DecodedChunkCache::new(8);
         let cached = worker.read_cached(&chunk, &mut src, 0, &mut out, 0, chunk_size, &cache);
         [uncached, cached]
     }
@@ -675,7 +812,7 @@ mod tests {
         let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, policy);
         let mut uncached = vec![0xff; chunk_size];
         let r = worker.read(&chunk, &mut src, 0, &mut uncached, 0, chunk_size);
-        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cache = DecodedChunkCache::new(8);
         let mut cached = vec![0xff; chunk_size];
         let c = worker.read_cached(&chunk, &mut src, 0, &mut cached, 0, chunk_size, &cache);
         [(r, uncached), (c, cached)]
@@ -754,7 +891,7 @@ mod tests {
             read_count: 0,
         };
         let mut worker = ReadWorker::new(chunk_size, chunk_size as u64, CorruptChunkPolicy::Error);
-        let cache = Mutex::new(DecodedChunkCache::new(8));
+        let cache = DecodedChunkCache::new(8);
         let mut out = vec![0; 512];
 
         let err = worker

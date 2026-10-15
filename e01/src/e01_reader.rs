@@ -638,7 +638,7 @@ pub struct E01Reader {
     /// `None` disables the decoded-chunk cache entirely -- there is then no
     /// lock to take and no chunk to insert, rather than a cache that is merely
     /// never asked for anything.
-    decoded_chunk_cache: Option<Arc<Mutex<DecodedChunkCache>>>,
+    decoded_chunk_cache: Option<Arc<DecodedChunkCache>>,
     runtime: Arc<Runtime>,
     io_log: Option<Arc<IoLog>>,
     parallel_chunk_reads: bool,
@@ -655,7 +655,7 @@ type ChunkTask<'a> = (
     usize,
     &'a Chunk,
     CacheWorkerSource,
-    Option<Arc<Mutex<DecodedChunkCache>>>,
+    Option<Arc<DecodedChunkCache>>,
     &'a mut [u8],
     usize,
     usize,
@@ -957,11 +957,9 @@ impl E01Reader {
             corrupt_chunk_policy: options.corrupt_chunk_policy,
             worker_pool: Mutex::new(vec![]),
             cache,
-            decoded_chunk_cache: options.decoded_chunk_cache.then(|| {
-                Arc::new(Mutex::new(DecodedChunkCache::new(
-                    DECODED_CHUNK_CACHE_CHUNKS,
-                )))
-            }),
+            decoded_chunk_cache: options
+                .decoded_chunk_cache
+                .then(|| Arc::new(DecodedChunkCache::new(DECODED_CHUNK_CACHE_CHUNKS))),
             runtime,
             io_log: options.io_log.clone(),
             parallel_chunk_reads: options.parallel_chunk_reads,
@@ -996,10 +994,9 @@ impl E01Reader {
         let tracing = self.io_log.is_some();
 
         let chunk_hit = if tracing {
-            self.decoded_chunk_cache.as_ref().map(|cache| {
-                let mut cache = cache.lock().unwrap();
-                (beg_chunk_index..end_chunk_index).all(|idx| cache.get(idx).is_some())
-            })
+            self.decoded_chunk_cache
+                .as_ref()
+                .map(|cache| (beg_chunk_index..end_chunk_index).all(|idx| cache.get(idx).is_some()))
         } else {
             None
         };

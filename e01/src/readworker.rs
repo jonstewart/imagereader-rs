@@ -1,15 +1,13 @@
-use flate2::read::ZlibDecoder;
-use simd_adler32::read::adler32;
+use flate2::{Decompress, FlushDecompress, Status};
 use std::{
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
-    io::{Cursor, Read},
     sync::{Arc, Mutex},
 };
 use tracing::{debug, error};
 
 use crate::e01_reader::{CorruptChunkPolicy, ReadErrorKind};
-use crate::sec_read::Chunk;
+use crate::sec_read::{Chunk, adler32};
 use crate::workersource::WorkerSource;
 
 /// Chunk indices are already well-distributed integers; SipHash on them is
@@ -156,17 +154,147 @@ impl DecodedChunkCache {
     }
 }
 
-#[derive(Debug)]
+/// Decoder state and scratch for reading one chunk at a time.
+///
+/// Everything a chunk read needs is allocated once, here, and reused: the
+/// stored bytes of a chunk, the inflater, and a chunk-sized buffer for
+/// decoding chunks that cannot be decoded straight into the caller's buffer.
 pub struct ReadWorker {
     chunk_size: usize,
     image_end: u64,
     corrupt_chunk_policy: CorruptChunkPolicy,
-    decoder: ZlibDecoder<Cursor<Vec<u8>>>,
+    inflater: Decompress,
+    /// A chunk as stored: up to `chunk_size` bytes of data plus a checksum.
+    stored: Vec<u8>,
+    /// A decoded chunk, when only part of it goes to the caller.
+    decoded: Vec<u8>,
 }
 
-impl Clone for ReadWorker {
-    fn clone(&self) -> Self {
-        Self::new(self.chunk_size, self.image_end, self.corrupt_chunk_policy)
+impl std::fmt::Debug for ReadWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadWorker")
+            .field("chunk_size", &self.chunk_size)
+            .field("image_end", &self.image_end)
+            .field("corrupt_chunk_policy", &self.corrupt_chunk_policy)
+            .finish()
+    }
+}
+
+/// Why a stored chunk failed to decode, before the corrupt-chunk policy has
+/// had its say.
+enum Corruption {
+    Inflate(std::io::Error),
+    BadChecksum(u32, u32),
+    TooShort(usize),
+}
+
+/// Inflate `stored` into `out`, which has room for a whole chunk.
+///
+/// The stream must end -- which is when zlib checks its adler32, the only
+/// checksum a compressed chunk carries -- having produced at least
+/// `decoded_len` bytes. Room for a whole chunk lets a final chunk compressed
+/// at full size decode, while a stream that would overflow a chunk runs out
+/// of space before it ends and fails.
+///
+/// This replaces reading exactly `decoded_len` bytes out of a streaming
+/// decoder, which stopped as soon as it had them: whatever the stream held
+/// past a chunk's worth went unread, and a chunk that inflated to more than a
+/// chunk was served as good data.
+fn inflate(
+    inflater: &mut Decompress,
+    stored: &[u8],
+    out: &mut [u8],
+    decoded_len: usize,
+) -> Result<(), Corruption> {
+    inflater.reset(true);
+    let status = inflater
+        .decompress(stored, out, FlushDecompress::Finish)
+        .map_err(|e| Corruption::Inflate(e.into()))?;
+    let produced = inflater.total_out() as usize;
+
+    let fail = |kind, msg: String| Err(Corruption::Inflate(std::io::Error::new(kind, msg)));
+    match status {
+        Status::StreamEnd if produced >= decoded_len => Ok(()),
+        Status::StreamEnd => fail(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("chunk inflated to {produced} bytes, expected {decoded_len}"),
+        ),
+        _ if inflater.total_in() as usize == stored.len() => fail(
+            std::io::ErrorKind::UnexpectedEof,
+            "compressed chunk ends before its stream does".into(),
+        ),
+        _ => fail(
+            std::io::ErrorKind::InvalidData,
+            format!("chunk inflates past {} bytes", out.len()),
+        ),
+    }
+}
+
+/// Check an uncompressed chunk -- its data followed by the data's adler32 --
+/// and return the length of the data. A final chunk may be stored at full
+/// size; every chunk must hold at least `decoded_len` bytes.
+fn check_uncompressed(stored: &[u8], decoded_len: usize) -> Result<usize, Corruption> {
+    let data_len = stored.len() - 4;
+    let crc_stored = u32::from_le_bytes(stored[data_len..].try_into().expect("4 bytes"));
+    let crc = adler32(&stored[..data_len]);
+    if crc != crc_stored {
+        return Err(Corruption::BadChecksum(crc, crc_stored));
+    }
+    if data_len < decoded_len {
+        return Err(Corruption::TooShort(stored.len()));
+    }
+    Ok(data_len)
+}
+
+/// Decode a stored chunk into `out` (room for a whole chunk), applying the
+/// corrupt-chunk policy to `out[..decoded_len]` if it does not decode cleanly.
+fn decode_into(
+    compressed: bool,
+    chunk_index: usize,
+    stored: &[u8],
+    out: &mut [u8],
+    decoded_len: usize,
+    policy: CorruptChunkPolicy,
+    inflater: &mut Decompress,
+) -> Result<(), ReadErrorKind> {
+    let outcome = if compressed {
+        inflate(inflater, stored, out, decoded_len)
+    } else {
+        check_uncompressed(stored, decoded_len).map(|data_len| {
+            let n = data_len.min(out.len());
+            out[..n].copy_from_slice(&stored[..n]);
+        })
+    };
+
+    let Err(corruption) = outcome else {
+        return Ok(());
+    };
+
+    error!("chunk {chunk_index} is corrupt");
+    let out = &mut out[..decoded_len];
+    match (policy, corruption) {
+        (CorruptChunkPolicy::Error, Corruption::Inflate(e)) => {
+            Err(ReadErrorKind::DecompressionFailed(chunk_index, e))
+        }
+        (CorruptChunkPolicy::Error, Corruption::BadChecksum(calc, stored)) => {
+            Err(ReadErrorKind::BadChecksum(chunk_index, calc, stored))
+        }
+        (CorruptChunkPolicy::Error, Corruption::TooShort(len)) => {
+            Err(ReadErrorKind::TooShort(chunk_index, len))
+        }
+        // Uncompressed data is still the data, checksum or no; a compressed
+        // chunk that will not inflate has nothing to offer.
+        (CorruptChunkPolicy::RawIfPossible, _) if !compressed => {
+            let raw = &stored[..stored.len() - 4];
+            let n = raw.len().min(out.len());
+            out[..n].copy_from_slice(&raw[..n]);
+            out[n..].fill(0);
+            Ok(())
+        }
+        _ => {
+            out.fill(0);
+            Ok(())
+        }
     }
 }
 
@@ -180,258 +308,10 @@ impl ReadWorker {
             chunk_size,
             image_end,
             corrupt_chunk_policy,
-            decoder: ZlibDecoder::new(Cursor::new(vec![0; chunk_size + 4])),
+            inflater: Decompress::new(true),
+            stored: vec![0; chunk_size + 4],
+            decoded: vec![0; chunk_size],
         }
-    }
-
-    fn read_compressed_read<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_off: u64,
-        chunk_len: usize,
-    ) -> Result<(), ReadErrorKind> {
-        // take the buffer from the decoder
-        let cur = self.decoder.reset(Cursor::new(vec![0; 0]));
-        let mut v = cur.into_inner();
-        let raw_data = &mut v[..chunk_len];
-
-        // do the read
-        let r = src
-            .read(chunk_off, raw_data)
-            .map_err(ReadErrorKind::IoError);
-
-        // give the buffer back to the decoder
-        self.decoder.reset(Cursor::new(v));
-
-        r
-    }
-
-    /// After a chunk's `decoded_len` bytes, the stream must end -- within a
-    /// chunk, since a final chunk may be compressed at full size. Reading only
-    /// the bytes wanted left whatever the stream held past a chunk unread,
-    /// and a chunk that inflated to more than a chunk was served as good data.
-    fn check_stream_end(&mut self, decoded_len: usize) -> std::io::Result<()> {
-        let room = (self.chunk_size - decoded_len) as u64;
-        let mut rest = vec![];
-        (&mut self.decoder).take(room + 1).read_to_end(&mut rest)?;
-        if rest.len() as u64 > room {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("chunk inflates past {} bytes", self.chunk_size),
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_compressed_decompress_full(
-        &mut self,
-        chunk_index: usize,
-        out: &mut [u8],
-    ) -> Result<(), ReadErrorKind> {
-        let decoded = self
-            .decoder
-            .read_exact(out)
-            .and_then(|()| self.check_stream_end(out.len()));
-        if let Err(e) = decoded {
-            error!("decompression failed for chunk {}: {}", chunk_index, e);
-            match self.corrupt_chunk_policy {
-                CorruptChunkPolicy::Error => {
-                    return Err(ReadErrorKind::DecompressionFailed(chunk_index, e));
-                }
-                CorruptChunkPolicy::Zero | CorruptChunkPolicy::RawIfPossible => {
-                    // zero out corrupt chunk
-                    out.fill(0);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_compressed<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_index: usize,
-        chunk_off: u64,
-        chunk_len: usize,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-    ) -> Result<(), ReadErrorKind> {
-        let chunk_beg = chunk_index as u64 * self.chunk_size as u64;
-        let decoded_len = (self.image_end - chunk_beg).min(self.chunk_size as u64) as usize;
-        let mut decoded = vec![0; decoded_len];
-
-        self.read_compressed_read(src, chunk_off, chunk_len)?;
-        self.read_compressed_decompress_full(chunk_index, &mut decoded)?;
-
-        buf.copy_from_slice(&decoded[beg_in_chunk..end_in_chunk]);
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_uncompressed<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_index: usize,
-        chunk_off: u64,
-        chunk_len: usize,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-    ) -> Result<(), ReadErrorKind> {
-        // take the buffer from the decoder
-        let cur = self.decoder.reset(Cursor::new(vec![0; 0]));
-        let mut v = cur.into_inner();
-        let raw_data = &mut v[..chunk_len];
-
-        // do the read
-        self.read_uncompressed_inner(
-            src,
-            chunk_index,
-            chunk_off,
-            buf,
-            beg_in_chunk,
-            end_in_chunk,
-            raw_data,
-        )?;
-
-        // give the buffer back to the decoder
-        self.decoder.reset(Cursor::new(v));
-
-        Ok(())
-    }
-
-    fn verify_uncompressed_payload(
-        &self,
-        chunk_index: usize,
-        raw_data: &[u8],
-    ) -> Result<Vec<u8>, ReadErrorKind> {
-        if raw_data.len() < 5 {
-            return Err(ReadErrorKind::TooShort(chunk_index, raw_data.len()));
-        }
-
-        let crc_stored = u32::from_le_bytes(
-            raw_data[raw_data.len() - 4..]
-                .try_into()
-                .expect("slice of last 4 bytes not 4 bytes long, wtf"),
-        );
-
-        let mut out = raw_data[..raw_data.len() - 4].to_vec();
-
-        let mut reader = Cursor::new(&out);
-        let crc = adler32(&mut reader).map_err(ReadErrorKind::IoError)?;
-
-        if crc != crc_stored {
-            error!("checksum mismatch reading chunk {}", chunk_index);
-            match self.corrupt_chunk_policy {
-                CorruptChunkPolicy::Error => {
-                    return Err(ReadErrorKind::BadChecksum(chunk_index, crc, crc_stored));
-                }
-                CorruptChunkPolicy::Zero => {
-                    out.fill(0);
-                }
-                CorruptChunkPolicy::RawIfPossible => {}
-            }
-        }
-
-        // A final chunk may be stored at full size, but every chunk must hold
-        // as much data as the image has left for it.
-        let chunk_beg = chunk_index as u64 * self.chunk_size as u64;
-        let decoded_len = (self.image_end - chunk_beg).min(self.chunk_size as u64) as usize;
-        if out.len() < decoded_len {
-            error!("chunk {chunk_index} is shorter than its data");
-            match self.corrupt_chunk_policy {
-                CorruptChunkPolicy::Error => {
-                    return Err(ReadErrorKind::TooShort(chunk_index, raw_data.len()));
-                }
-                CorruptChunkPolicy::Zero => out.fill(0),
-                CorruptChunkPolicy::RawIfPossible => {}
-            }
-            out.resize(decoded_len, 0);
-        }
-
-        Ok(out)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_uncompressed_inner<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_index: usize,
-        chunk_off: u64,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-        raw_data: &mut [u8],
-    ) -> Result<(), ReadErrorKind> {
-        src.read(chunk_off, raw_data)
-            .map_err(ReadErrorKind::IoError)?;
-
-        let out = self.verify_uncompressed_payload(chunk_index, raw_data)?;
-        buf.copy_from_slice(&out[beg_in_chunk..end_in_chunk]);
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_uncompressed_cached<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_index: usize,
-        chunk_off: u64,
-        chunk_len: usize,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-        cache: &DecodedChunkCache,
-    ) -> Result<(), ReadErrorKind> {
-        if let Some(chunk) = cache.get(chunk_index) {
-            buf.copy_from_slice(&chunk[beg_in_chunk..end_in_chunk]);
-            return Ok(());
-        }
-
-        let mut raw_data = vec![0; chunk_len];
-        src.read(chunk_off, &mut raw_data)
-            .map_err(ReadErrorKind::IoError)?;
-
-        let payload = self.verify_uncompressed_payload(chunk_index, &raw_data)?;
-        buf.copy_from_slice(&payload[beg_in_chunk..end_in_chunk]);
-        cache.insert(chunk_index, Arc::from(payload));
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn read_compressed_cached<WS: WorkerSource>(
-        &mut self,
-        src: &mut WS,
-        chunk_index: usize,
-        chunk_off: u64,
-        chunk_len: usize,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-        cache: &DecodedChunkCache,
-    ) -> Result<(), ReadErrorKind> {
-        if let Some(chunk) = cache.get(chunk_index) {
-            buf.copy_from_slice(&chunk[beg_in_chunk..end_in_chunk]);
-            return Ok(());
-        }
-
-        let chunk_beg = chunk_index as u64 * self.chunk_size as u64;
-        let decoded_len = (self.image_end - chunk_beg).min(self.chunk_size as u64) as usize;
-        let mut decoded = vec![0; decoded_len];
-
-        self.read_compressed_read(src, chunk_off, chunk_len)?;
-        self.read_compressed_decompress_full(chunk_index, &mut decoded)?;
-
-        buf.copy_from_slice(&decoded[beg_in_chunk..end_in_chunk]);
-        cache.insert(chunk_index, Arc::from(decoded));
-
-        Ok(())
     }
 
     /// Chunk offsets come from the image's table sections and are untrusted:
@@ -450,6 +330,101 @@ impl ReadWorker {
             })
     }
 
+    /// Read `[beg_in_chunk, end_in_chunk)` of chunk `chunk_index` into `buf`.
+    ///
+    /// With a `cache`, a chunk already in it is served from there, and when
+    /// `insert` is set a chunk that has to be decoded is added to it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_chunk<WS: WorkerSource>(
+        &mut self,
+        chunk: &Chunk,
+        src: &mut WS,
+        chunk_index: usize,
+        buf: &mut [u8],
+        beg_in_chunk: usize,
+        end_in_chunk: usize,
+        cache: Option<&DecodedChunkCache>,
+        insert: bool,
+    ) -> Result<(), ReadErrorKind> {
+        let stored_len = self.checked_chunk_len(chunk, chunk_index)?;
+
+        debug!("reading chunk {chunk_index} [{beg_in_chunk},{end_in_chunk})");
+
+        if let Some(data) = cache.and_then(|c| c.get(chunk_index)) {
+            buf.copy_from_slice(&data[beg_in_chunk..end_in_chunk]);
+            return Ok(());
+        }
+
+        if !chunk.compressed && stored_len < 5 {
+            return Err(ReadErrorKind::TooShort(chunk_index, stored_len));
+        }
+
+        let chunk_beg = chunk_index as u64 * self.chunk_size as u64;
+        let decoded_len = (self.image_end - chunk_beg).min(self.chunk_size as u64) as usize;
+
+        let stored = &mut self.stored[..stored_len];
+        src.read(chunk.data_offset, stored)
+            .map_err(ReadErrorKind::IoError)?;
+
+        let insert = insert.then_some(cache).flatten();
+
+        // A caller asking for the whole of a full-size chunk gets it decoded
+        // straight into its buffer, rather than into scratch and then copied.
+        if beg_in_chunk == 0 && end_in_chunk == self.chunk_size {
+            decode_into(
+                chunk.compressed,
+                chunk_index,
+                stored,
+                buf,
+                decoded_len,
+                self.corrupt_chunk_policy,
+                &mut self.inflater,
+            )?;
+            if let Some(cache) = insert {
+                cache.insert(chunk_index, Arc::from(&*buf));
+            }
+        } else {
+            decode_into(
+                chunk.compressed,
+                chunk_index,
+                stored,
+                &mut self.decoded,
+                decoded_len,
+                self.corrupt_chunk_policy,
+                &mut self.inflater,
+            )?;
+            buf.copy_from_slice(&self.decoded[beg_in_chunk..end_in_chunk]);
+            if let Some(cache) = insert {
+                cache.insert(chunk_index, Arc::from(&self.decoded[..decoded_len]));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn read<WS: WorkerSource>(
+        &mut self,
+        chunk: &Chunk,
+        src: &mut WS,
+        chunk_index: usize,
+        buf: &mut [u8],
+        beg_in_chunk: usize,
+        end_in_chunk: usize,
+    ) -> Result<(), ReadErrorKind> {
+        self.read_chunk(
+            chunk,
+            src,
+            chunk_index,
+            buf,
+            beg_in_chunk,
+            end_in_chunk,
+            None,
+            false,
+        )
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn read_cached<WS: WorkerSource>(
         &mut self,
@@ -461,71 +436,16 @@ impl ReadWorker {
         end_in_chunk: usize,
         cache: &DecodedChunkCache,
     ) -> Result<(), ReadErrorKind> {
-        let chunk_len = self.checked_chunk_len(chunk, chunk_index)?;
-        let chunk_off = chunk.data_offset;
-
-        debug!("reading chunk {chunk_index} [{beg_in_chunk},{end_in_chunk})");
-
-        if chunk.compressed {
-            self.read_compressed_cached(
-                src,
-                chunk_index,
-                chunk_off,
-                chunk_len,
-                buf,
-                beg_in_chunk,
-                end_in_chunk,
-                cache,
-            )
-        } else {
-            self.read_uncompressed_cached(
-                src,
-                chunk_index,
-                chunk_off,
-                chunk_len,
-                buf,
-                beg_in_chunk,
-                end_in_chunk,
-                cache,
-            )
-        }
-    }
-
-    pub fn read<WS: WorkerSource>(
-        &mut self,
-        chunk: &Chunk,
-        src: &mut WS,
-        chunk_index: usize,
-        buf: &mut [u8],
-        beg_in_chunk: usize,
-        end_in_chunk: usize,
-    ) -> Result<(), ReadErrorKind> {
-        let chunk_len = self.checked_chunk_len(chunk, chunk_index)?;
-        let chunk_off = chunk.data_offset;
-
-        debug!("reading chunk {chunk_index} [{beg_in_chunk},{end_in_chunk})");
-
-        if chunk.compressed {
-            self.read_compressed(
-                src,
-                chunk_index,
-                chunk_off,
-                chunk_len,
-                buf,
-                beg_in_chunk,
-                end_in_chunk,
-            )
-        } else {
-            self.read_uncompressed(
-                src,
-                chunk_index,
-                chunk_off,
-                chunk_len,
-                buf,
-                beg_in_chunk,
-                end_in_chunk,
-            )
-        }
+        self.read_chunk(
+            chunk,
+            src,
+            chunk_index,
+            buf,
+            beg_in_chunk,
+            end_in_chunk,
+            Some(cache),
+            true,
+        )
     }
 }
 
@@ -585,7 +505,7 @@ mod tests {
 
     fn uncompressed_chunk_with_trailer(data: &[u8]) -> Vec<u8> {
         let mut raw = data.to_vec();
-        let crc = adler32(&mut Cursor::new(data)).unwrap();
+        let crc = adler32(data);
         raw.extend_from_slice(&crc.to_le_bytes());
         raw
     }
@@ -721,8 +641,9 @@ mod tests {
     }
 
     /// A zlib stream ends with an adler32 of its decompressed bytes; it is the
-    /// only checksum a compressed EWF chunk has, and a chunk whose adler32
-    /// does not match must not be served as good data.
+    /// only checksum a compressed EWF chunk has. Reading exactly the chunk's
+    /// worth of output stops the decoder before it reaches the trailer, so a
+    /// corrupt checksum went unnoticed and the chunk was served as good data.
     #[test]
     fn compressed_chunk_with_bad_adler32_is_an_error() {
         let chunk_size = 32768;
@@ -776,8 +697,8 @@ mod tests {
         }
     }
 
-    /// A chunk that inflates to less than a chunk has no data for the rest of
-    /// the chunk, and inventing zeros for it would be silent.
+    /// Likewise one that inflates to less than a chunk: there is no data for
+    /// the rest of the chunk, and inventing zeros for it would be silent.
     #[test]
     fn compressed_chunk_that_inflates_short_is_an_error() {
         let chunk_size = 32768;

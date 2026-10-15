@@ -630,7 +630,7 @@ pub struct E01Reader {
     /// so every client serialized on it: 8 concurrent clients got *less*
     /// throughput than one (34 vs 38 MiB/s) with a p99 of 28ms against 0.35ms.
     ///
-    /// A ReadWorker is a zlib decoder plus a `chunk_size + 4` buffer (~32 KiB),
+    /// A ReadWorker is an inflater plus two chunk-sized buffers (~64 KiB),
     /// so pooling them costs a little memory per concurrent read and nothing
     /// else. The lock is held only to pop and push, never across a read.
     worker_pool: Mutex<Vec<ReadWorker>>,
@@ -745,27 +745,19 @@ fn run_chunk_task(task: ChunkTask<'_>) -> Result<(), ReadError> {
         worker,
     ) = task;
 
-    match decoded_chunk_cache {
-        Some(cache) => worker.read_cached(
+    worker
+        .read_chunk(
             chunk,
             &mut src,
             chunk_index,
             sbuf,
             beg_in_chunk,
             end_in_chunk,
-            &cache,
-        ),
-        None => worker.read(
-            chunk,
-            &mut src,
-            chunk_index,
-            sbuf,
-            beg_in_chunk,
-            end_in_chunk,
-        ),
-    }
-    .map_err(ReadError::from)
-    .map_err(|e| e.with_path(seg_path))
+            decoded_chunk_cache.as_deref(),
+            true,
+        )
+        .map_err(ReadError::from)
+        .map_err(|e| e.with_path(seg_path))
 }
 
 impl Debug for E01Reader {

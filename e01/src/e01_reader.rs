@@ -7,7 +7,7 @@ use std::{
     fs::File,
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex, Weak,
+        Arc, LazyLock, Mutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -730,8 +730,11 @@ pub struct E01Reader {
     decoded_chunk_cache: Option<DecodedChunkCache>,
     io_log: Option<Arc<IoLog>>,
     parallel_chunk_reads: bool,
-    /// `None` uses rayon's global pool.
-    chunk_pool: Option<Arc<rayon::ThreadPool>>,
+    parallel_chunk_threads: usize,
+    /// Built on the first read that fans out, so opening an image -- or
+    /// reading it a chunk at a time -- spawns no threads. Inner `None` uses
+    /// rayon's global pool.
+    chunk_pool: OnceLock<Option<Arc<rayon::ThreadPool>>>,
 }
 
 const DECODED_CHUNK_CACHE_CHUNKS: usize = 1024;
@@ -1118,8 +1121,17 @@ impl E01Reader {
                 .then(|| DecodedChunkCache::new(DECODED_CHUNK_CACHE_CHUNKS)),
             io_log: options.io_log.clone(),
             parallel_chunk_reads: options.parallel_chunk_reads,
-            chunk_pool: chunk_pool(options.parallel_chunk_threads)?,
+            parallel_chunk_threads: options.parallel_chunk_threads,
+            chunk_pool: OnceLock::new(),
         })
+    }
+
+    /// The pool a read fans out over, built on first use. A pool that cannot
+    /// be built degrades to rayon's global one rather than failing reads.
+    fn chunk_pool(&self) -> Option<&rayon::ThreadPool> {
+        self.chunk_pool
+            .get_or_init(|| chunk_pool(self.parallel_chunk_threads).unwrap_or(None))
+            .as_deref()
     }
 
     /// Takes `&self`: a reader can serve concurrent reads without a lock around
@@ -1238,7 +1250,7 @@ impl E01Reader {
         let run = |task: &mut ChunkTask<'_>| self.read_task(task, trace);
 
         if self.parallel_chunk_reads && tasks.len() >= FAN_OUT_MIN_CHUNKS {
-            let pool = self.chunk_pool.as_deref();
+            let pool = self.chunk_pool();
             let threads = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
             fanout::run(pool, threads, &mut tasks, &run)
         } else {

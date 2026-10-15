@@ -589,14 +589,15 @@ pub struct E01ReaderOptions {
     /// many pools.
     pub parallel_chunk_threads: usize,
 
-    /// Keep a secondary LRU of *decompressed* chunks, in front of the foyer
-    /// block cache.
+    /// Keep a cache of *decompressed* chunks, sized by
+    /// `decoded_chunk_cache_mib`.
     ///
-    /// It only pays when a chunk is read more than once -- e.g. a filesystem
-    /// issuing 4 KiB reads inside a 32 KiB chunk. On a sequential whole-image
-    /// scan every chunk is touched exactly once, so the hit rate is zero and it
-    /// is pure overhead: an Arc<Vec<u8>> allocation, an insert and an eviction
-    /// per chunk, for a lookup that never comes.
+    /// It pays when a chunk is read more than once -- e.g. a filesystem
+    /// issuing 4 KiB reads inside a 32 KiB chunk. Only chunks a client is
+    /// likely to come back for are inserted: those it read part of, and those
+    /// it read on their own. The whole chunks inside a large read are decoded
+    /// straight into the caller's buffer and not kept, so a sequential scan in
+    /// large reads costs the cache nothing.
     pub decoded_chunk_cache: bool,
 
     /// Read segments that are local files directly, with positioned reads,
@@ -608,6 +609,10 @@ pub struct E01ReaderOptions {
     /// cache options apply only to segments that are not local files, and
     /// opening an all-local image starts no tokio runtime and builds no cache.
     pub direct_file_io: bool,
+
+    /// Size of the decoded-chunk cache, in MiB (see
+    /// [`DEFAULT_DECODED_CHUNK_CACHE_MIB`]).
+    pub decoded_chunk_cache_mib: usize,
 
     /// Decompress a multi-chunk read's chunks in parallel, over rayon.
     ///
@@ -636,6 +641,7 @@ impl Default for E01ReaderOptions {
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
             direct_file_io: true,
+            decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
         }
     }
 }
@@ -737,7 +743,16 @@ pub struct E01Reader {
     chunk_pool: OnceLock<Option<Arc<rayon::ThreadPool>>>,
 }
 
-const DECODED_CHUNK_CACHE_CHUNKS: usize = 1024;
+/// Default size of the decoded-chunk cache, in MiB (8192 chunks of 32 KiB).
+///
+/// Its entries are decoded chunks, so a hit saves an inflate rather than a
+/// disk read. A filesystem's metadata -- an MFT, inode tables, directories --
+/// is re-read all over an analysis, and a cache smaller than that working set
+/// mostly misses: 200k random 4 KiB reads over 256 MiB of an NTFS image hit
+/// 1 time in 8 with a 32 MiB cache. Local segments no longer go through the
+/// 1 GiB block cache, so this is still a quarter of what a reader used to
+/// hold, and it fills only as chunks are actually read.
+pub const DEFAULT_DECODED_CHUNK_CACHE_MIB: usize = 256;
 
 /// One chunk's worth of a read: which chunk, which part of it, and where in
 /// the caller's buffer it goes.
@@ -803,6 +818,7 @@ impl E01Reader {
     fn read_task(
         &self,
         task: &mut ChunkTask<'_>,
+        insert: bool,
         foyer_trace: Option<&Mutex<ReadTrace>>,
     ) -> Result<(), ReadError> {
         let chunk = &self.chunks[task.chunk_index];
@@ -820,7 +836,7 @@ impl E01Reader {
                 task.beg_in_chunk,
                 task.end_in_chunk,
                 cache,
-                true,
+                insert,
             ),
             ChunkStore::Cached { cache: c, runtime } => worker.read_chunk(
                 chunk,
@@ -835,7 +851,7 @@ impl E01Reader {
                 task.beg_in_chunk,
                 task.end_in_chunk,
                 cache,
-                true,
+                insert,
             ),
         };
 
@@ -1116,9 +1132,10 @@ impl E01Reader {
             corrupt_chunk_policy: options.corrupt_chunk_policy,
             worker_pool: WorkerPool::new(),
             store,
-            decoded_chunk_cache: options
-                .decoded_chunk_cache
-                .then(|| DecodedChunkCache::new(DECODED_CHUNK_CACHE_CHUNKS)),
+            decoded_chunk_cache: options.decoded_chunk_cache.then(|| {
+                let chunks = (options.decoded_chunk_cache_mib << 20) / chunk_size;
+                DecodedChunkCache::new(chunks.max(1))
+            }),
             io_log: options.io_log.clone(),
             parallel_chunk_reads: options.parallel_chunk_reads,
             parallel_chunk_threads: options.parallel_chunk_threads,
@@ -1189,7 +1206,7 @@ impl E01Reader {
                 beg_in_chunk,
                 end_in_chunk: beg_in_chunk + read_len,
             };
-            self.read_task(&mut task, trace)?;
+            self.read_task(&mut task, true, trace)?;
         } else if n_chunks > 1 {
             self.read_chunks(buf, buf_beg, beg_chunk_index, end_chunk_index, trace)?;
         }
@@ -1247,7 +1264,15 @@ impl E01Reader {
             chunk_beg += chunk_size;
         }
 
-        let run = |task: &mut ChunkTask<'_>| self.read_task(task, trace);
+        // Keep decoded chunks that a client is likely to come back for: any
+        // chunk it read only part of. (A lone chunk read on its own is kept
+        // too; see `read_at_offset`.) The whole chunks inside a bulk read are
+        // not worth caching -- a sequential scan never asks for them again --
+        // and inserting them costs an allocation and a copy apiece.
+        let run = |task: &mut ChunkTask<'_>| {
+            let partial = task.end_in_chunk - task.beg_in_chunk < self.chunk_size;
+            self.read_task(task, partial, trace)
+        };
 
         if self.parallel_chunk_reads && tasks.len() >= FAN_OUT_MIN_CHUNKS {
             let pool = self.chunk_pool();
@@ -1372,6 +1397,7 @@ mod test {
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
             direct_file_io: true,
+            decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1410,6 +1436,7 @@ mod test {
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
             direct_file_io: true,
+            decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1578,6 +1605,32 @@ mod test {
         for r in reads {
             assert!(r.contains(r#""foyer":"n/a""#), "{r}");
         }
+    }
+
+    /// The decoded-chunk cache keeps the chunks a client read part of, or
+    /// read on their own, and not the whole chunks inside a larger read.
+    #[test]
+    fn only_chunks_likely_to_be_read_again_are_cached() {
+        let reader = E01Reader::open_glob(
+            crate::test_data::IMAGE_E01.segment_paths[0],
+            &Default::default(),
+        )
+        .unwrap();
+        let chunk = reader.chunk_size as u64;
+
+        let mut bulk = vec![0u8; 4 * reader.chunk_size];
+        reader.read_at_offset(4 * chunk, &mut bulk).unwrap();
+        let mut part = vec![0u8; 512];
+        reader.read_at_offset(10 * chunk + 100, &mut part).unwrap();
+        let mut whole = vec![0u8; reader.chunk_size];
+        reader.read_at_offset(12 * chunk, &mut whole).unwrap();
+
+        let cache = reader.decoded_chunk_cache.as_ref().unwrap();
+        for c in 4..8 {
+            assert!(cache.get(c).is_none(), "bulk chunk {c} was cached");
+        }
+        assert!(cache.get(10).is_some(), "partly read chunk was not cached");
+        assert!(cache.get(12).is_some(), "lone chunk was not cached");
     }
 
     #[test]

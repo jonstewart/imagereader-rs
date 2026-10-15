@@ -30,8 +30,8 @@ mod test {
     use crate::{
         e01_reader::{
             CacheMode, CorruptChunkPolicy, CorruptSectionPolicy, DEFAULT_CACHE_BLOCK_SIZE,
-            DEFAULT_CACHE_FETCH_SIZE, DEFAULT_CACHE_MEM_MIB, DEFAULT_PARALLEL_CHUNK_THREADS,
-            DEFAULT_S3_CONCURRENCY, E01Reader, E01ReaderOptions,
+            DEFAULT_CACHE_FETCH_SIZE, DEFAULT_CACHE_MEM_MIB, DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            DEFAULT_PARALLEL_CHUNK_THREADS, DEFAULT_S3_CONCURRENCY, E01Reader, E01ReaderOptions,
         },
         hasher::HashType,
         test_data::*,
@@ -102,6 +102,7 @@ mod test {
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
             direct_file_io: true,
+            decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
         }
     }
 
@@ -121,6 +122,7 @@ mod test {
             parallel_chunk_threads: DEFAULT_PARALLEL_CHUNK_THREADS,
             decoded_chunk_cache: true,
             direct_file_io: true,
+            decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
         }
     }
 

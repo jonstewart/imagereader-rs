@@ -105,12 +105,33 @@ impl ReadWorker {
         r
     }
 
+    /// After a chunk's `decoded_len` bytes, the stream must end -- within a
+    /// chunk, since a final chunk may be compressed at full size. Reading only
+    /// the bytes wanted left whatever the stream held past a chunk unread,
+    /// and a chunk that inflated to more than a chunk was served as good data.
+    fn check_stream_end(&mut self, decoded_len: usize) -> std::io::Result<()> {
+        let room = (self.chunk_size - decoded_len) as u64;
+        let mut rest = vec![];
+        (&mut self.decoder).take(room + 1).read_to_end(&mut rest)?;
+        if rest.len() as u64 > room {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk inflates past {} bytes", self.chunk_size),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_compressed_decompress_full(
         &mut self,
         chunk_index: usize,
         out: &mut [u8],
     ) -> Result<(), ReadErrorKind> {
-        if let Err(e) = self.decoder.read_exact(out) {
+        let decoded = self
+            .decoder
+            .read_exact(out)
+            .and_then(|()| self.check_stream_end(out.len()));
+        if let Err(e) = decoded {
             error!("decompression failed for chunk {}: {}", chunk_index, e);
             match self.corrupt_chunk_policy {
                 CorruptChunkPolicy::Error => {
@@ -577,6 +598,22 @@ mod tests {
             .collect::<Vec<_>>();
         let mut stored = compressed_chunk(&data);
         stored.truncate(stored.len() - 4);
+
+        for r in read_compressed_strict(stored, chunk_size) {
+            assert!(
+                matches!(r, Err(ReadErrorKind::DecompressionFailed(..))),
+                "got {r:?}"
+            );
+        }
+    }
+
+    /// A chunk that inflates to more than a chunk's worth of data is corrupt;
+    /// taking the first chunk_size bytes of it would hide that.
+    #[test]
+    fn compressed_chunk_that_inflates_past_the_chunk_size_is_an_error() {
+        let chunk_size = 32768;
+        let data = vec![0x5a; chunk_size + 512];
+        let stored = compressed_chunk(&data);
 
         for r in read_compressed_strict(stored, chunk_size) {
             assert!(

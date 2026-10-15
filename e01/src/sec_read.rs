@@ -19,7 +19,12 @@ pub struct Chunk {
 #[derive(Debug)]
 pub enum Section {
     Volume(VolumeSection),
-    Table(Vec<Chunk>),
+    /// A table: its raw, checksum-verified offset array (see
+    /// [`table_chunks`]) and its base offset.
+    Table {
+        entries: Vec<u8>,
+        base_offset: u64,
+    },
     Sectors(u64),
     Hash([u8; 16]),
     Digest([u8; 16], [u8; 20]),
@@ -27,10 +32,16 @@ pub enum Section {
     Other,
 }
 
+/// The Adler-32 of `data`, which is what EWF stores to check every section
+/// and every uncompressed chunk.
+pub(crate) fn adler32(data: &[u8]) -> u32 {
+    let mut h = simd_adler32::Adler32::new();
+    h.write(data);
+    h.finish()
+}
+
 fn checksum_reader(reader: &BytesReader, len: usize) -> Result<u32, IoError> {
-    Ok(simd_adler32::read::adler32(&mut std::io::Cursor::new(
-        &reader.read_bytes(len).map_err(IoError::Read)?,
-    ))?)
+    Ok(adler32(&reader.read_bytes(len).map_err(IoError::Read)?))
 }
 
 fn checksum_ok(
@@ -64,7 +75,13 @@ fn read_section(io: &BytesReader, ignore_checksums: bool) -> Result<(usize, Sect
         "disk" | "volume" => {
             Section::Volume(VolumeSection::new(io, section_size, ignore_checksums)?)
         }
-        "table" => Section::Table(read_table(io, section_size, ignore_checksums)?),
+        "table" => {
+            let (entries, base_offset) = read_table(io, section_size, ignore_checksums)?;
+            Section::Table {
+                entries,
+                base_offset,
+            }
+        }
         "sectors" => Section::Sectors(io.pos() as u64 + section_size),
         "hash" => Section::Hash(read_hash_section(io, ignore_checksums)?),
         "digest" => {
@@ -133,22 +150,64 @@ fn read_digest_section(
     Ok((md5, sha1))
 }
 
-fn read_table_entry(io: &BytesReader, table_offset: u64) -> Result<Chunk, LibError> {
-    let entry = io.read_u4le().map_err(IoError::Read)?;
+/// Turn a table's raw offset array into chunks.
+///
+/// Each entry's low 31 bits are the chunk's offset from the table's base
+/// offset, and its high bit says whether the chunk is compressed.
+///
+/// Offsets must rise monotonically: each entry is the end of the
+/// chunk before it, so going backwards would give that chunk a negative length.
+///
+/// The chunks are appended to `chunks` -- one vector for the whole segment, so
+/// a large image's million-odd chunks are written once rather than built per
+/// table and copied.
+pub fn table_chunks(
+    raw_entries: &[u8],
+    table_offset: u64,
+    segment: usize,
+    chunks: &mut Vec<Chunk>,
+) -> Result<(), LibError> {
+    chunks.reserve(raw_entries.len() / 4);
+    let mut prev_rel = 0u64;
 
-    Ok(Chunk {
-        segment: 0,
-        data_offset: table_offset + ((entry & 0x7fffffff) as u64),
-        end_offset: 0,
-        compressed: (entry & 0x80000000) > 0,
-    })
+    for (i, raw) in raw_entries.chunks_exact(4).enumerate() {
+        let stored = u32::from_le_bytes(raw.try_into().expect("table entries are 4 bytes")) as u64;
+
+        let (rel, compressed) = (stored & 0x7fffffff, stored & 0x80000000 != 0);
+
+        if i > 0 {
+            let prev = chunks.last_mut().expect("entry i - 1 was pushed");
+            if rel < prev_rel {
+                return Err(LibError::CorruptChunkTable(format!(
+                    "entry {} offset {} precedes entry {} offset {}",
+                    i,
+                    table_offset + rel,
+                    i - 1,
+                    prev.data_offset,
+                )));
+            }
+            prev.end_offset = table_offset + rel;
+        }
+
+        chunks.push(Chunk {
+            segment,
+            data_offset: table_offset + rel,
+            end_offset: 0,
+            compressed,
+        });
+        prev_rel = rel;
+    }
+
+    Ok(())
 }
 
+/// Read a table section's header and offset array, checking both checksums.
+/// Returns the raw offset array and the table's base offset.
 pub fn read_table(
     io: &BytesReader,
     _size: u64,
     ignore_checksums: bool,
-) -> Result<Vec<Chunk>, LibError> {
+) -> Result<(Vec<u8>, u64), LibError> {
     let table_section = EwfTableHeader::read_into::<_, EwfTableHeader>(io, None, None)
         .map_err(|e| LibError::DeserializationFailed("EwfTableHeader", e))?;
 
@@ -167,39 +226,22 @@ pub fn read_table(
     }
 
     let entry_count = raw_entry_count as usize;
+    let base_offset = *table_section.table_base_offset();
     if entry_count == 0 {
         // weird, but possible?
-        return Ok(vec![]);
+        return Ok((vec![], base_offset));
     }
 
-    let io_offsets = Clone::clone(io);
-    let table_offset = *table_section.table_base_offset();
-    let mut chunks: Vec<Chunk> = Vec::with_capacity(entry_count);
-
-    chunks.push(read_table_entry(io, table_offset)?);
-
-    for i in 1..entry_count {
-        let ch = read_table_entry(io, table_offset)?;
-        // each entry is the previous chunk's end; going backwards would give
-        // that chunk a negative length
-        if ch.data_offset < chunks[i - 1].data_offset {
-            return Err(LibError::CorruptChunkTable(format!(
-                "entry {} offset {} precedes entry {} offset {}",
-                i,
-                ch.data_offset,
-                i - 1,
-                chunks[i - 1].data_offset,
-            )));
-        }
-        chunks[i - 1].end_offset = ch.data_offset;
-        chunks.push(ch);
-    }
+    // The whole offset array in one read. Reading it an entry at a time
+    // costs a kaitai round trip -- an allocation and a stream sync -- per
+    // chunk, which on a large image was most of the time spent opening it.
+    let raw_entries = io.read_bytes(entry_count * 4).map_err(IoError::Read)?;
 
     if !ignore_checksums {
         // table footer
         let crc_stored = io.read_u4le().map_err(IoError::Read)?;
 
-        let crc = checksum_reader(&io_offsets, *table_section.entry_count() as usize * 4)?;
+        let crc = adler32(&raw_entries);
 
         if crc != crc_stored {
             return Err(LibError::BadChecksum(
@@ -210,7 +252,7 @@ pub fn read_table(
         }
     }
 
-    Ok(chunks)
+    Ok((raw_entries, base_offset))
 }
 
 #[derive(Debug, Default)]
@@ -349,14 +391,55 @@ mod tests {
         b
     }
 
+    fn table_chunks(raw: &[u8], base: u64) -> Result<Vec<Chunk>, LibError> {
+        let mut chunks = vec![];
+        super::table_chunks(raw, base, 0, &mut chunks).map(|_| chunks)
+    }
+
     /// Chunk data offsets must be monotonic — each entry is the previous
     /// chunk's end. A table where they go backwards would give a chunk a
     /// negative length downstream.
     #[test]
     fn non_monotonic_table_entries_are_an_error() {
         let io = BytesReader::from(table_bytes(2, &[0x100, 0x80]));
-        let err = read_table(&io, 0, true).unwrap_err();
+        let (raw, base) = read_table(&io, 0, true).unwrap();
+        let err = table_chunks(&raw, base).unwrap_err();
         assert!(matches!(err, LibError::CorruptChunkTable(_)), "got {err:?}");
+    }
+
+    /// Tables append to one vector per segment; a table's monotonicity check
+    /// must not compare its first entry with the last chunk of the table
+    /// before it, which belongs to an unrelated run of offsets.
+    #[test]
+    fn a_table_does_not_check_against_the_previous_table() {
+        let mut chunks = vec![];
+        super::table_chunks(&entries(&[0x9000, 0xa000]), 0, 2, &mut chunks).unwrap();
+        super::table_chunks(&entries(&[0x100, 0x200]), 0, 2, &mut chunks).unwrap();
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|c| c.segment == 2));
+        // the first table's last chunk is left for the caller to end
+        assert_eq!(chunks[1].end_offset, 0);
+    }
+
+    fn entries(raw: &[u32]) -> Vec<u8> {
+        raw.iter().flat_map(|e| e.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn table_entries_carry_offset_and_compression() {
+        let chunks = table_chunks(&entries(&[0x80000100, 0x200, 0x80000300]), 0x1000).unwrap();
+        let got: Vec<_> = chunks
+            .iter()
+            .map(|c| (c.data_offset, c.end_offset, c.compressed))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0x1100, 0x1200, true),
+                (0x1200, 0x1300, false),
+                (0x1300, 0, true)
+            ]
+        );
     }
 
     /// entry_count is a raw u32 from the image; EWF caps table entries at

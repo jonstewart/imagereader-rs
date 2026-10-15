@@ -13,7 +13,7 @@ use crate::{
     cacheworkersource::CacheWorkerSource,
     error::{IoError, LibError},
     readworker::{DecodedChunkCache, ReadWorker},
-    sec_read::{Chunk, Section, SectionIterator, VolumeSection},
+    sec_read::{Chunk, Section, SectionIterator, VolumeSection, table_chunks},
     seg_path::{SegPathError, UnrecognizedExtension, validated_segment_paths},
     segment::SegmentFileHeader,
 };
@@ -221,9 +221,11 @@ fn read_segment<T: AsRef<str>>(
 
     let mut done = false;
 
-    // we can't reserve capacity for chunks because we don't know how many
-    // chunks are in a segment until we read all its table sections
-    let mut chunks = vec![];
+    // A segment's chunk count is known only once all of its tables are read,
+    // so the tables are collected first and parsed into one exactly-sized
+    // vector after. Growing it table by table instead reallocated and copied
+    // it a dozen times over, which was most of the time spent opening.
+    let mut tables = vec![];
 
     let mut end_of_sectors = 0;
 
@@ -242,12 +244,10 @@ fn read_segment<T: AsRef<str>>(
 
         match section {
             Section::Volume(v) => volume = Some(v),
-            Section::Table(t) if !t.is_empty() => {
-                chunks.extend(t);
-                // set the end of the last chunk in the table
-                let chunks_len = chunks.len();
-                chunks[chunks_len - 1].end_offset = end_of_sectors;
-            }
+            Section::Table {
+                entries,
+                base_offset,
+            } if !entries.is_empty() => tables.push((entries, base_offset, end_of_sectors)),
             Section::Sectors(eos) => end_of_sectors = eos,
             Section::Hash(h) => md5 = Some(h),
             Section::Digest(d_md5, d_sha1) => {
@@ -266,9 +266,14 @@ fn read_segment<T: AsRef<str>>(
         warn!("more sections after done");
     }
 
-    // set the segment index for these chunks
-    for c in &mut chunks {
-        c.segment = segment_index;
+    let mut chunks = Vec::with_capacity(tables.iter().map(|t| t.0.len() / 4).sum());
+    for (entries, base_offset, end_of_sectors) in tables {
+        table_chunks(&entries, base_offset, segment_index, &mut chunks)
+            .map_err(OpenError::from)
+            .map_err(|e| e.with_path(&segment_path))?;
+        // the table does not record where its last chunk ends
+        let last = chunks.last_mut().expect("a non-empty table adds chunks");
+        last.end_offset = end_of_sectors;
     }
 
     Ok(SegmentComponents {
@@ -321,15 +326,18 @@ struct E01Metadata {
     chunks: Vec<Chunk>,
 }
 
-fn process_segments<S: IntoIterator<Item = SegmentComponents>>(
-    segs: S,
-) -> Result<E01Metadata, OpenError> {
+fn process_segments(segs: Vec<SegmentComponents>) -> Result<E01Metadata, OpenError> {
     let mut volume = None;
     let mut stored_md5 = None;
     let mut stored_sha1 = None;
 
     let mut segment_paths = vec![];
-    let mut chunks = vec![];
+    // Sized from the chunks actually parsed, so each is copied once at most --
+    // and not at all for a single-segment image, whose vector is taken whole.
+    let mut chunks = match segs.len() {
+        1 => vec![],
+        _ => Vec::with_capacity(segs.iter().map(|s| s.chunks.len()).sum()),
+    };
 
     let mut done = false;
 
@@ -348,13 +356,7 @@ fn process_segments<S: IntoIterator<Item = SegmentComponents>>(
         // take the volume section if it's the first one
         match (seg.volume, &volume) {
             // we have no volume section, and saw one
-            (Some(sv), None) => {
-                // we can size the chunks vec now; chunk_count is untrusted
-                // image data, so cap the up-front reservation
-                let unread_chunks = (sv.chunk_count as usize).saturating_sub(chunks.len());
-                chunks.reserve_exact(unread_chunks.min(1 << 20));
-                volume = Some(sv);
-            }
+            (Some(sv), None) => volume = Some(sv),
             // we have a volume section, and didn't see a new one
             (None, Some(_)) => {}
             // we have no volume section, and saw none;
@@ -379,7 +381,11 @@ fn process_segments<S: IntoIterator<Item = SegmentComponents>>(
         }
 
         // record the chunks
-        chunks.extend(seg.chunks);
+        if chunks.capacity() == 0 {
+            chunks = seg.chunks;
+        } else {
+            chunks.extend(seg.chunks);
+        }
 
         // record the segment
         segment_paths.push(seg.path);

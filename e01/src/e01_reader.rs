@@ -593,11 +593,12 @@ pub struct E01ReaderOptions {
     /// `decoded_chunk_cache_mib`.
     ///
     /// It pays when a chunk is read more than once -- e.g. a filesystem
-    /// issuing 4 KiB reads inside a 32 KiB chunk. Only chunks a client is
-    /// likely to come back for are inserted: those it read part of, and those
-    /// it read on their own. The whole chunks inside a large read are decoded
-    /// straight into the caller's buffer and not kept, so a sequential scan in
-    /// large reads costs the cache nothing.
+    /// issuing 4 KiB reads inside a 32 KiB chunk -- and it is where
+    /// `sequential_readahead` puts the chunks it decodes ahead. Only chunks a
+    /// client is likely to come back for are inserted: those it read part of,
+    /// and those it read on their own. The whole chunks inside a large read
+    /// are decoded straight into the caller's buffer and not kept, so a
+    /// sequential scan in large reads costs the cache nothing.
     pub decoded_chunk_cache: bool,
 
     /// Read segments that are local files directly, with positioned reads,
@@ -613,6 +614,11 @@ pub struct E01ReaderOptions {
     /// Size of the decoded-chunk cache, in MiB (see
     /// [`DEFAULT_DECODED_CHUNK_CACHE_MIB`]).
     pub decoded_chunk_cache_mib: usize,
+
+    /// When small reads run sequentially, decode the chunks ahead of them on
+    /// the decompression pool, into the decoded-chunk cache. Needs
+    /// `decoded_chunk_cache` and `parallel_chunk_reads`.
+    pub sequential_readahead: bool,
 
     /// Decompress a multi-chunk read's chunks in parallel, over rayon.
     ///
@@ -642,6 +648,7 @@ impl Default for E01ReaderOptions {
             decoded_chunk_cache: true,
             direct_file_io: true,
             decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            sequential_readahead: true,
         }
     }
 }
@@ -703,22 +710,27 @@ impl WorkerPool {
     }
 }
 
-pub struct E01Reader {
+/// One chunk's worth of a read: which chunk, which part of it, and where in
+/// the caller's buffer it goes.
+struct ChunkTask<'a> {
+    chunk_index: usize,
+    buf: &'a mut [u8],
+    beg_in_chunk: usize,
+    end_in_chunk: usize,
+}
+
+/// Fewest chunks in a read worth fanning out over the decompression pool.
+/// Below this, waking a helper costs about what it would save.
+const FAN_OUT_MIN_CHUNKS: usize = 3;
+
+/// Everything a chunk read needs, shared between the reader and the
+/// read-ahead jobs it spawns, which can outlive any one call.
+struct Shared {
     chunks: Vec<Chunk>,
-
-    pub chunk_size: usize,
-    pub chunk_count: usize,
-    pub sector_size: usize,
-    pub sector_count: usize,
-    pub image_size: u64,
-
-    pub stored_md5: Option<[u8; 16]>,
-    pub stored_sha1: Option<[u8; 20]>,
-
-    /// Segment files in sequence order; `Chunk::segment` indexes this.
-    pub segment_paths: Vec<PathBuf>,
-
+    chunk_size: usize,
+    image_size: u64,
     corrupt_chunk_policy: CorruptChunkPolicy,
+    segment_paths: Vec<PathBuf>,
 
     /// Decoder scratch. `read_at_offset` takes `&self`, so a reader serves
     /// concurrent reads without a lock around it: the workers are the only
@@ -734,6 +746,49 @@ pub struct E01Reader {
     /// lock to take and no chunk to insert, rather than a cache that is merely
     /// never asked for anything.
     decoded_chunk_cache: Option<DecodedChunkCache>,
+}
+
+/// Read-ahead never starts with fewer chunks than this...
+const READAHEAD_MIN_CHUNKS: usize = 4;
+/// ...and grows, as a sequential run goes on, to at most this many (1 MiB of
+/// 32 KiB chunks).
+const READAHEAD_MAX_CHUNKS: usize = 32;
+/// Only reads of at most this many chunks drive read-ahead. A bigger read
+/// already fans its own chunks out over the pool, decoding them straight into
+/// the caller's buffer; reading ahead of it would decode into the cache and
+/// copy out again.
+const READAHEAD_MAX_READ_CHUNKS: usize = 2;
+
+/// Sequential read detection, for decoding the chunks a reader is about to
+/// ask for on the pool while it is still busy with the ones before.
+///
+/// A small read is decoded on the caller's thread, one chunk at a time, so a
+/// sequential scan in 4 KiB or 64 KiB reads ran at the speed of one inflater
+/// while the pool sat idle. Racy by design: concurrent readers interleave
+/// their updates, which can only start or stop a read-ahead early.
+#[derive(Default)]
+struct Readahead {
+    /// The chunk just past the end of the last read.
+    next: AtomicUsize,
+    /// The first chunk not yet sent ahead.
+    frontier: AtomicUsize,
+    window: AtomicUsize,
+}
+
+pub struct E01Reader {
+    pub chunk_size: usize,
+    pub chunk_count: usize,
+    pub sector_size: usize,
+    pub sector_count: usize,
+    pub image_size: u64,
+
+    pub stored_md5: Option<[u8; 16]>,
+    pub stored_sha1: Option<[u8; 20]>,
+
+    /// Segment files in sequence order; `Chunk::segment` indexes this.
+    pub segment_paths: Vec<PathBuf>,
+
+    shared: Arc<Shared>,
     io_log: Option<Arc<IoLog>>,
     parallel_chunk_reads: bool,
     parallel_chunk_threads: usize,
@@ -741,6 +796,7 @@ pub struct E01Reader {
     /// reading it a chunk at a time -- spawns no threads. Inner `None` uses
     /// rayon's global pool.
     chunk_pool: OnceLock<Option<Arc<rayon::ThreadPool>>>,
+    readahead: Option<Readahead>,
 }
 
 /// Default size of the decoded-chunk cache, in MiB (8192 chunks of 32 KiB).
@@ -753,19 +809,6 @@ pub struct E01Reader {
 /// 1 GiB block cache, so this is still a quarter of what a reader used to
 /// hold, and it fills only as chunks are actually read.
 pub const DEFAULT_DECODED_CHUNK_CACHE_MIB: usize = 256;
-
-/// One chunk's worth of a read: which chunk, which part of it, and where in
-/// the caller's buffer it goes.
-struct ChunkTask<'a> {
-    chunk_index: usize,
-    buf: &'a mut [u8],
-    beg_in_chunk: usize,
-    end_in_chunk: usize,
-}
-
-/// Fewest chunks in a read worth fanning out over the decompression pool.
-/// Below this, waking a helper costs about what it would save.
-const FAN_OUT_MIN_CHUNKS: usize = 3;
 
 /// Threads this process may actually use.
 ///
@@ -813,7 +856,24 @@ fn chunk_pool(requested: usize) -> Result<Option<Arc<rayon::ThreadPool>>, OpenEr
     Ok(Some(pool))
 }
 
-impl E01Reader {
+impl Debug for E01Reader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("E01Reader")
+            .field("chunks", &self.shared.chunks)
+            .field("chunk_size", &self.chunk_size)
+            .field("chunk_count", &self.chunk_count)
+            .field("sector_size", &self.sector_size)
+            .field("sector_count", &self.sector_count)
+            .field("image_size", &self.image_size)
+            .field("stored_md5", &self.stored_md5)
+            .field("stored_sha1", &self.stored_sha1)
+            .field("segment_paths", &self.segment_paths)
+            .field("corrupt_chunk_policy", &self.shared.corrupt_chunk_policy)
+            .finish()
+    }
+}
+
+impl Shared {
     /// Read one chunk's part of a read.
     fn read_task(
         &self,
@@ -862,22 +922,17 @@ impl E01Reader {
             .map_err(ReadError::from)
             .map_err(|e| e.with_path(&self.segment_paths[chunk.segment]))
     }
-}
 
-impl Debug for E01Reader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("E01Reader")
-            .field("chunks", &self.chunks)
-            .field("chunk_size", &self.chunk_size)
-            .field("chunk_count", &self.chunk_count)
-            .field("sector_size", &self.sector_size)
-            .field("sector_count", &self.sector_count)
-            .field("image_size", &self.image_size)
-            .field("stored_md5", &self.stored_md5)
-            .field("stored_sha1", &self.stored_sha1)
-            .field("segment_paths", &self.segment_paths)
-            .field("corrupt_chunk_policy", &self.corrupt_chunk_policy)
-            .finish()
+    /// Decode a chunk into the cache, unless it is there already. Failures
+    /// are dropped: the read that wants the chunk will meet them itself.
+    fn prefetch(&self, chunk_index: usize) {
+        let mut task = ChunkTask {
+            chunk_index,
+            buf: &mut [],
+            beg_in_chunk: 0,
+            end_in_chunk: 0,
+        };
+        let _ = self.read_task(&mut task, true, None);
     }
 }
 
@@ -1119,8 +1174,14 @@ impl E01Reader {
 
         validate_chunk_coverage(image_size, chunk_count, chunk_size)?;
 
+        let segment_paths: Vec<PathBuf> =
+            meta.segment_paths.into_iter().map(PathBuf::from).collect();
+        let decoded_chunk_cache = options.decoded_chunk_cache.then(|| {
+            let chunks = (options.decoded_chunk_cache_mib << 20) / chunk_size;
+            DecodedChunkCache::new(chunks.max(1))
+        });
+
         Ok(Self {
-            chunks: meta.chunks,
             chunk_count,
             chunk_size,
             sector_count,
@@ -1128,13 +1189,20 @@ impl E01Reader {
             image_size,
             stored_md5: meta.md5,
             stored_sha1: meta.sha1,
-            segment_paths: meta.segment_paths.into_iter().map(PathBuf::from).collect(),
-            corrupt_chunk_policy: options.corrupt_chunk_policy,
-            worker_pool: WorkerPool::new(),
-            store,
-            decoded_chunk_cache: options.decoded_chunk_cache.then(|| {
-                let chunks = (options.decoded_chunk_cache_mib << 20) / chunk_size;
-                DecodedChunkCache::new(chunks.max(1))
+            segment_paths: segment_paths.clone(),
+            readahead: (options.sequential_readahead
+                && options.parallel_chunk_reads
+                && decoded_chunk_cache.is_some())
+            .then(Readahead::default),
+            shared: Arc::new(Shared {
+                chunks: meta.chunks,
+                chunk_size,
+                image_size,
+                corrupt_chunk_policy: options.corrupt_chunk_policy,
+                segment_paths,
+                worker_pool: WorkerPool::new(),
+                store,
+                decoded_chunk_cache,
             }),
             io_log: options.io_log.clone(),
             parallel_chunk_reads: options.parallel_chunk_reads,
@@ -1149,6 +1217,59 @@ impl E01Reader {
         self.chunk_pool
             .get_or_init(|| chunk_pool(self.parallel_chunk_threads).unwrap_or(None))
             .as_deref()
+    }
+
+    /// Send the chunks after a sequential read ahead to be decoded into the
+    /// cache, on the pool. `[beg, end)` are the chunks the read covers.
+    fn read_ahead(&self, beg: usize, end: usize) {
+        let Some(ra) = &self.readahead else {
+            return;
+        };
+
+        // Sequential: this read starts where the last one ended, or inside the
+        // last chunk it read.
+        let expected = ra.next.swap(end, Ordering::Relaxed);
+        let sequential = beg == expected || beg + 1 == expected;
+        if !sequential || end - beg > READAHEAD_MAX_READ_CHUNKS {
+            ra.window.store(READAHEAD_MIN_CHUNKS, Ordering::Relaxed);
+            ra.frontier.store(end, Ordering::Relaxed);
+            return;
+        }
+
+        let frontier = ra.frontier.load(Ordering::Relaxed).max(end);
+        let window = ra.window.load(Ordering::Relaxed).max(READAHEAD_MIN_CHUNKS);
+        // Plenty already sent ahead: wait until the reader is halfway into it.
+        if frontier >= end + window / 2 {
+            return;
+        }
+        let target = (end + window).min(self.chunk_count);
+        if frontier >= target {
+            return;
+        }
+        ra.frontier.store(target, Ordering::Relaxed);
+        ra.window
+            .store((window * 2).min(READAHEAD_MAX_CHUNKS), Ordering::Relaxed);
+
+        let pool = self.chunk_pool();
+        let cache = self.shared.decoded_chunk_cache.as_ref();
+        for chunk_index in frontier..target {
+            // Already decoded -- re-reading a region, or a short image read
+            // again from the top. A job would only find it there.
+            if cache.is_some_and(|c| c.contains(chunk_index)) {
+                continue;
+            }
+            // Weak: a reader dropped meanwhile cancels what has not started.
+            let shared = Arc::downgrade(&self.shared);
+            let job = move || {
+                if let Some(shared) = shared.upgrade() {
+                    shared.prefetch(chunk_index);
+                }
+            };
+            match pool {
+                Some(pool) => pool.spawn(job),
+                None => rayon::spawn(job),
+            }
+        }
     }
 
     /// Takes `&self`: a reader can serve concurrent reads without a lock around
@@ -1184,7 +1305,8 @@ impl E01Reader {
         let tracing = self.io_log.is_some();
 
         let chunk_hit = if tracing {
-            self.decoded_chunk_cache
+            self.shared
+                .decoded_chunk_cache
                 .as_ref()
                 .map(|cache| (beg_chunk_index..end_chunk_index).all(|idx| cache.get(idx).is_some()))
         } else {
@@ -1192,8 +1314,12 @@ impl E01Reader {
         };
 
         // Only a read through the block cache has a foyer verdict to report.
-        let foyer_trace = (tracing && matches!(self.store, ChunkStore::Cached { .. }))
+        let foyer_trace = (tracing && matches!(self.shared.store, ChunkStore::Cached { .. }))
             .then(|| Mutex::new(ReadTrace::default()));
+
+        if n_chunks > 0 {
+            self.read_ahead(beg_chunk_index, end_chunk_index);
+        }
 
         let trace = foyer_trace.as_ref();
 
@@ -1206,7 +1332,7 @@ impl E01Reader {
                 beg_in_chunk,
                 end_in_chunk: beg_in_chunk + read_len,
             };
-            self.read_task(&mut task, true, trace)?;
+            self.shared.read_task(&mut task, true, trace)?;
         } else if n_chunks > 1 {
             self.read_chunks(buf, buf_beg, beg_chunk_index, end_chunk_index, trace)?;
         }
@@ -1271,7 +1397,7 @@ impl E01Reader {
         // and inserting them costs an allocation and a copy apiece.
         let run = |task: &mut ChunkTask<'_>| {
             let partial = task.end_in_chunk - task.beg_in_chunk < self.chunk_size;
-            self.read_task(task, partial, trace)
+            self.shared.read_task(task, partial, trace)
         };
 
         if self.parallel_chunk_reads && tasks.len() >= FAN_OUT_MIN_CHUNKS {
@@ -1358,6 +1484,149 @@ mod test {
         );
     }
 
+    /// Read directly from a local file there is no block cache, so no foyer
+    /// verdict: the trace must say so rather than report a "hit" that never
+    /// happened. The decoded-chunk verdicts are unaffected.
+    #[test]
+    fn read_trace_on_direct_io_has_no_foyer_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("io.jsonl");
+        let io_log = IoLog::open(&log_path).unwrap();
+        io_log.begin_serving().unwrap();
+
+        let options = E01ReaderOptions {
+            io_log: Some(io_log.clone()),
+            ..Default::default()
+        };
+        assert!(options.direct_file_io);
+        let reader =
+            E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        reader.read_at_offset(0, &mut buf).unwrap();
+        reader.read_at_offset(0, &mut buf).unwrap();
+
+        drop(reader);
+        drop(io_log);
+
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let reads: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains(r#""kind":"read""#))
+            .collect();
+        assert_eq!(reads.len(), 2, "one record per read: {body}");
+        assert!(reads[0].contains(r#""chunk":"miss""#), "{}", reads[0]);
+        assert!(reads[1].contains(r#""chunk":"hit""#), "{}", reads[1]);
+        for r in reads {
+            assert!(r.contains(r#""foyer":"n/a""#), "{r}");
+        }
+    }
+
+    /// The decoded-chunk cache keeps the chunks a client read part of, or
+    /// read on their own, and not the whole chunks inside a larger read.
+    #[test]
+    fn only_chunks_likely_to_be_read_again_are_cached() {
+        let reader = E01Reader::open_glob(
+            crate::test_data::IMAGE_E01.segment_paths[0],
+            &Default::default(),
+        )
+        .unwrap();
+        let chunk = reader.chunk_size as u64;
+
+        let mut bulk = vec![0u8; 4 * reader.chunk_size];
+        reader.read_at_offset(4 * chunk, &mut bulk).unwrap();
+        let mut part = vec![0u8; 512];
+        reader.read_at_offset(10 * chunk + 100, &mut part).unwrap();
+        let mut whole = vec![0u8; reader.chunk_size];
+        reader.read_at_offset(12 * chunk, &mut whole).unwrap();
+
+        let cache = reader.shared.decoded_chunk_cache.as_ref().unwrap();
+        for c in 4..8 {
+            assert!(cache.get(c).is_none(), "bulk chunk {c} was cached");
+        }
+        assert!(cache.get(10).is_some(), "partly read chunk was not cached");
+        assert!(cache.get(12).is_some(), "lone chunk was not cached");
+    }
+
+    #[test]
+    fn last_chunk_ends_with_its_sectors_section() {
+        // sectors section [0x100, 0x9000), table after it
+        assert_eq!(last_chunk_end(0x8000, 0x9000, 0x9500), 0x9000);
+    }
+
+    #[test]
+    fn last_chunk_inside_the_table_section_ends_with_it() {
+        // no sectors section; the chunk data follows the offsets in the table
+        assert_eq!(last_chunk_end(0x2000, 0, 0x9500), 0x9500);
+    }
+
+    #[test]
+    fn last_chunk_past_both_keeps_bounds_that_fail_the_read() {
+        // neither section contains the chunk: leave it inverted, which a read
+        // rejects as corrupt bounds rather than guessing a length
+        assert!(last_chunk_end(0xa000, 0x9000, 0x9500) < 0xa000);
+    }
+
+    /// Small sequential reads send the chunks after them to be decoded into
+    /// the cache on the pool; random ones do not.
+    #[test]
+    fn sequential_small_reads_decode_ahead_into_the_cache() {
+        let reader = E01Reader::open_glob(
+            crate::test_data::IMAGE_E01.segment_paths[0],
+            &Default::default(),
+        )
+        .unwrap();
+        let cache = reader.shared.decoded_chunk_cache.as_ref().unwrap();
+        let chunk = reader.chunk_size as u64;
+
+        let mut buf = vec![0u8; 4096];
+        for off in (0..2 * chunk).step_by(4096) {
+            reader.read_at_offset(off, &mut buf).unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cache.get(3).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "chunk 3 was never decoded ahead"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // and what was decoded ahead is what a read decodes
+        let ahead = cache.get(3).unwrap();
+        let mut direct = vec![0u8; reader.chunk_size];
+        let fresh = E01Reader::open_glob(
+            crate::test_data::IMAGE_E01.segment_paths[0],
+            &E01ReaderOptions {
+                decoded_chunk_cache: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fresh.read_at_offset(3 * chunk, &mut direct).unwrap();
+        assert_eq!(&ahead[..], &direct[..]);
+    }
+
+    #[test]
+    fn random_reads_do_not_read_ahead() {
+        let reader = E01Reader::open_glob(
+            crate::test_data::IMAGE_E01.segment_paths[0],
+            &Default::default(),
+        )
+        .unwrap();
+        let chunk = reader.chunk_size as u64;
+        let mut buf = vec![0u8; 512];
+        for c in [9u64, 2, 30, 17, 5] {
+            reader.read_at_offset(c * chunk + 100, &mut buf).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let cache = reader.shared.decoded_chunk_cache.as_ref().unwrap();
+        for c in [10, 3, 31, 18, 6] {
+            assert!(cache.get(c).is_none(), "chunk {c} was read ahead");
+        }
+    }
+
     /// A declared size that fits within the chunks is fine; one larger than
     /// the chunks cover would index past self.chunks on a read near the end,
     /// so it must be rejected at open.
@@ -1398,6 +1667,7 @@ mod test {
             decoded_chunk_cache: true,
             direct_file_io: true,
             decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            sequential_readahead: true,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1437,6 +1707,7 @@ mod test {
             decoded_chunk_cache: true,
             direct_file_io: true,
             decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            sequential_readahead: true,
         };
         let reader =
             E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
@@ -1567,89 +1838,6 @@ mod test {
             total_sector_count: 64,
         };
         assert!(validate_volume(&volume).is_ok());
-    }
-
-    /// Read directly from a local file there is no block cache, so no foyer
-    /// verdict: the trace must say so rather than report a "hit" that never
-    /// happened. The decoded-chunk verdicts are unaffected.
-    #[test]
-    fn read_trace_on_direct_io_has_no_foyer_verdict() {
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("io.jsonl");
-        let io_log = IoLog::open(&log_path).unwrap();
-        io_log.begin_serving().unwrap();
-
-        let options = E01ReaderOptions {
-            io_log: Some(io_log.clone()),
-            ..Default::default()
-        };
-        assert!(options.direct_file_io);
-        let reader =
-            E01Reader::open_glob(crate::test_data::IMAGE_E01.segment_paths[0], &options).unwrap();
-
-        let mut buf = vec![0u8; 4096];
-        reader.read_at_offset(0, &mut buf).unwrap();
-        reader.read_at_offset(0, &mut buf).unwrap();
-
-        drop(reader);
-        drop(io_log);
-
-        let body = std::fs::read_to_string(&log_path).unwrap();
-        let reads: Vec<&str> = body
-            .lines()
-            .filter(|l| l.contains(r#""kind":"read""#))
-            .collect();
-        assert_eq!(reads.len(), 2, "one record per read: {body}");
-        assert!(reads[0].contains(r#""chunk":"miss""#), "{}", reads[0]);
-        assert!(reads[1].contains(r#""chunk":"hit""#), "{}", reads[1]);
-        for r in reads {
-            assert!(r.contains(r#""foyer":"n/a""#), "{r}");
-        }
-    }
-
-    /// The decoded-chunk cache keeps the chunks a client read part of, or
-    /// read on their own, and not the whole chunks inside a larger read.
-    #[test]
-    fn only_chunks_likely_to_be_read_again_are_cached() {
-        let reader = E01Reader::open_glob(
-            crate::test_data::IMAGE_E01.segment_paths[0],
-            &Default::default(),
-        )
-        .unwrap();
-        let chunk = reader.chunk_size as u64;
-
-        let mut bulk = vec![0u8; 4 * reader.chunk_size];
-        reader.read_at_offset(4 * chunk, &mut bulk).unwrap();
-        let mut part = vec![0u8; 512];
-        reader.read_at_offset(10 * chunk + 100, &mut part).unwrap();
-        let mut whole = vec![0u8; reader.chunk_size];
-        reader.read_at_offset(12 * chunk, &mut whole).unwrap();
-
-        let cache = reader.decoded_chunk_cache.as_ref().unwrap();
-        for c in 4..8 {
-            assert!(cache.get(c).is_none(), "bulk chunk {c} was cached");
-        }
-        assert!(cache.get(10).is_some(), "partly read chunk was not cached");
-        assert!(cache.get(12).is_some(), "lone chunk was not cached");
-    }
-
-    #[test]
-    fn last_chunk_ends_with_its_sectors_section() {
-        // sectors section [0x100, 0x9000), table after it
-        assert_eq!(last_chunk_end(0x8000, 0x9000, 0x9500), 0x9000);
-    }
-
-    #[test]
-    fn last_chunk_inside_the_table_section_ends_with_it() {
-        // no sectors section; the chunk data follows the offsets in the table
-        assert_eq!(last_chunk_end(0x2000, 0, 0x9500), 0x9500);
-    }
-
-    #[test]
-    fn last_chunk_past_both_keeps_bounds_that_fail_the_read() {
-        // neither section contains the chunk: leave it inverted, which a read
-        // rejects as corrupt bounds rather than guessing a length
-        assert!(last_chunk_end(0xa000, 0x9000, 0x9500) < 0xa000);
     }
 
     /// A section descriptor: 16-byte type, next offset, size, padding and

@@ -103,6 +103,7 @@ mod test {
             decoded_chunk_cache: true,
             direct_file_io: true,
             decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            sequential_readahead: true,
         }
     }
 
@@ -123,6 +124,7 @@ mod test {
             decoded_chunk_cache: true,
             direct_file_io: true,
             decoded_chunk_cache_mib: DEFAULT_DECODED_CHUNK_CACHE_MIB,
+            sequential_readahead: true,
         }
     }
 

@@ -143,6 +143,15 @@ impl DecodedChunkCache {
             .get(chunk_index)
     }
 
+    /// Whether the cache holds a chunk, without counting as a use of it.
+    pub fn contains(&self, chunk_index: usize) -> bool {
+        self.shard(chunk_index)
+            .lock()
+            .expect("decoded chunk cache poisoned")
+            .index
+            .contains_key(&chunk_index)
+    }
+
     pub fn insert(&self, chunk_index: usize, chunk: Arc<[u8]>) {
         let mut shard = self
             .shard(chunk_index)

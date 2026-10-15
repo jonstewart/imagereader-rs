@@ -52,6 +52,19 @@ paths.
 their checksums, and configures caching, readahead, S3 concurrency and I/O
 logging.
 
+### Performance
+
+Segments that are local files are read directly, with positioned reads; the
+OS page cache does the caching, and the foyer cache options apply only to S3
+segments (set `direct_file_io: false` to route local files through it too).
+`read_at_offset` takes `&self`, so one reader serves concurrent threads with
+no lock around it. Multi-chunk reads decompress on the calling thread and a
+small pool together, and small sequential reads have the chunks ahead of them
+decoded on that pool.
+
+[`compare/`](compare/README.md) benchmarks e01-rs against libewf, directly and
+under The Sleuth Kit, and checks that both return the same bytes.
+
 ### Binaries
 
 * `e01verify` hashes an image and compares the result with the stored digests.

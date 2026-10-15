@@ -11,6 +11,7 @@ mod test_helper;
 
 mod cacheworkersource;
 mod error;
+mod fanout;
 mod generated;
 pub mod hasher;
 mod localsource;

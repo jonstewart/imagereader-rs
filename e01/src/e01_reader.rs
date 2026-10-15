@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::{
     cacheworkersource::CacheWorkerSource,
     error::{IoError, LibError},
+    fanout,
     localsource::{FileReadSeek, LocalSource},
     readworker::{DecodedChunkCache, ReadWorker},
     sec_read::{Chunk, Section, SectionIterator, VolumeSection, table_chunks},
@@ -744,6 +745,10 @@ struct ChunkTask<'a> {
     end_in_chunk: usize,
 }
 
+/// Fewest chunks in a read worth fanning out over the decompression pool.
+/// Below this, waking a helper costs about what it would save.
+const FAN_OUT_MIN_CHUNKS: usize = 3;
+
 /// Threads this process may actually use.
 ///
 /// Respects `sched_setaffinity` (`taskset`) and cgroup CPU quotas, which is the
@@ -794,7 +799,7 @@ impl E01Reader {
     /// Read one chunk's part of a read.
     fn read_task(
         &self,
-        task: ChunkTask<'_>,
+        task: &mut ChunkTask<'_>,
         foyer_trace: Option<&Mutex<ReadTrace>>,
     ) -> Result<(), ReadError> {
         let chunk = &self.chunks[task.chunk_index];
@@ -1119,9 +1124,8 @@ impl E01Reader {
 
     /// Takes `&self`: a reader can serve concurrent reads without a lock around
     /// it. See `worker_pool` for what used to require `&mut`.
-    pub fn read_at_offset(&self, mut offset: u64, mut buf: &mut [u8]) -> Result<usize, ReadError> {
+    pub fn read_at_offset(&self, offset: u64, mut buf: &mut [u8]) -> Result<usize, ReadError> {
         let timer = self.io_log.as_ref().map(|_| ReadTimer::start());
-        let read_offset = offset;
         // don't start reading past the end
         let image_end = self.image_size;
         if offset > image_end {
@@ -1135,11 +1139,18 @@ impl E01Reader {
 
         let buf_beg = offset;
         let buf_end = offset + buf.len() as u64;
+        let read_len = buf.len();
 
         let chunk_size = self.chunk_size as u64;
 
         let beg_chunk_index = (buf_beg / chunk_size) as usize;
-        let end_chunk_index = (buf_end / chunk_size + (buf_end % chunk_size).min(1)) as usize;
+        // A read of nothing touches no chunk -- not even the one it starts in,
+        // which rounding its end up would otherwise decode for nothing.
+        let end_chunk_index = match read_len {
+            0 => beg_chunk_index,
+            _ => buf_end.div_ceil(chunk_size) as usize,
+        };
+        let n_chunks = end_chunk_index.saturating_sub(beg_chunk_index);
 
         let tracing = self.io_log.is_some();
 
@@ -1155,56 +1166,29 @@ impl E01Reader {
         let foyer_trace = (tracing && matches!(self.store, ChunkStore::Cached { .. }))
             .then(|| Mutex::new(ReadTrace::default()));
 
-        let mut tasks = Vec::with_capacity(end_chunk_index - beg_chunk_index);
+        let trace = foyer_trace.as_ref();
 
-        while offset < buf_end {
-            // get the next chunk
-            let chunk_index = (offset / chunk_size) as usize;
-
-            let chunk_beg = chunk_index as u64 * chunk_size;
-            let chunk_end = std::cmp::min(chunk_beg + chunk_size, image_end);
-
-            let beg_in_chunk = (offset - chunk_beg) as usize;
-            let end_in_chunk = (std::cmp::min(chunk_end, buf_end) - chunk_beg) as usize;
-
-            let beg_in_buf = offset - buf_beg;
-            let end_in_buf = beg_in_buf + (end_in_chunk - beg_in_chunk) as u64;
-
-            let (bleft, bright) = buf.split_at_mut((end_in_buf - beg_in_buf) as usize);
-            buf = bright;
-
-            tasks.push(ChunkTask {
-                chunk_index,
-                buf: bleft,
+        if n_chunks == 1 {
+            // The common case for a small read, with no task list to build.
+            let beg_in_chunk = (buf_beg - beg_chunk_index as u64 * chunk_size) as usize;
+            let mut task = ChunkTask {
+                chunk_index: beg_chunk_index,
+                buf,
                 beg_in_chunk,
-                end_in_chunk,
-            });
-
-            offset += end_in_buf - beg_in_buf;
+                end_in_chunk: beg_in_chunk + read_len,
+            };
+            self.read_task(&mut task, trace)?;
+        } else if n_chunks > 1 {
+            self.read_chunks(buf, buf_beg, beg_chunk_index, end_chunk_index, trace)?;
         }
 
-        // A single chunk is driven inline either way; there is nothing to fan out.
-        let fan_out = self.parallel_chunk_reads && tasks.len() > 1;
-
-        let trace = foyer_trace.as_ref();
-        let run = |task| self.read_task(task, trace);
-        if fan_out {
-            match &self.chunk_pool {
-                Some(pool) => pool.install(|| tasks.into_par_iter().try_for_each(run)),
-                None => tasks.into_par_iter().try_for_each(run),
-            }
-        } else {
-            tasks.into_iter().try_for_each(run)
-        }?;
-
-        let read_len = (offset - buf_beg) as usize;
         if let Some(log) = &self.io_log {
             let dur_us = timer.as_ref().map(ReadTimer::elapsed_us).unwrap_or(0);
             let foyer = foyer_trace
                 .as_ref()
                 .map_or("n/a", |t| t.lock().unwrap().foyer_label());
             log.log_read(
-                read_offset,
+                buf_beg,
                 read_len,
                 dur_us,
                 foyer,
@@ -1213,6 +1197,53 @@ impl E01Reader {
         }
 
         Ok(read_len)
+    }
+
+    /// Read a span of several chunks, `[beg_chunk_index, end_chunk_index)`,
+    /// into `buf`, which starts at image offset `buf_beg`.
+    fn read_chunks(
+        &self,
+        mut buf: &mut [u8],
+        buf_beg: u64,
+        beg_chunk_index: usize,
+        end_chunk_index: usize,
+        trace: Option<&Mutex<ReadTrace>>,
+    ) -> Result<(), ReadError> {
+        let chunk_size = self.chunk_size as u64;
+        let image_end = self.image_size;
+        let buf_end = buf_beg + buf.len() as u64;
+
+        let mut tasks = Vec::with_capacity(end_chunk_index - beg_chunk_index);
+        let mut chunk_beg = beg_chunk_index as u64 * chunk_size;
+        let mut pos = buf_beg;
+        for chunk_index in beg_chunk_index..end_chunk_index {
+            let chunk_end = (chunk_beg + chunk_size).min(image_end);
+            let beg_in_chunk = (pos - chunk_beg) as usize;
+            let end_in_chunk = (chunk_end.min(buf_end) - chunk_beg) as usize;
+
+            let (here, rest) = std::mem::take(&mut buf).split_at_mut(end_in_chunk - beg_in_chunk);
+            buf = rest;
+
+            tasks.push(ChunkTask {
+                chunk_index,
+                buf: here,
+                beg_in_chunk,
+                end_in_chunk,
+            });
+
+            pos = chunk_beg + end_in_chunk as u64;
+            chunk_beg += chunk_size;
+        }
+
+        let run = |task: &mut ChunkTask<'_>| self.read_task(task, trace);
+
+        if self.parallel_chunk_reads && tasks.len() >= FAN_OUT_MIN_CHUNKS {
+            let pool = self.chunk_pool.as_deref();
+            let threads = pool.map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
+            fanout::run(pool, threads, &mut tasks, &run)
+        } else {
+            tasks.iter_mut().try_for_each(run)
+        }
     }
 }
 

@@ -153,9 +153,15 @@ fn read_digest_section(
 /// Turn a table's raw offset array into chunks.
 ///
 /// Each entry's low 31 bits are the chunk's offset from the table's base
-/// offset, and its high bit says whether the chunk is compressed.
+/// offset, and its high bit says whether the chunk is compressed -- until the
+/// offsets outgrow 31 bits. EnCase 6.7 writes segment files past 2 GiB without
+/// a base offset to keep entries small, so the offsets simply carry into the
+/// high bit. As libewf does, an entry whose masked offset goes backwards while
+/// its full 32-bit value goes forwards marks that overflow: from there on the
+/// whole entry is the offset, and the chunks are stored uncompressed (there is
+/// no bit left to say otherwise).
 ///
-/// Offsets must rise monotonically: each entry is the end of the
+/// Offsets must otherwise rise monotonically: each entry is the end of the
 /// chunk before it, so going backwards would give that chunk a negative length.
 ///
 /// The chunks are appended to `chunks` -- one vector for the whole segment, so
@@ -168,12 +174,23 @@ pub fn table_chunks(
     chunks: &mut Vec<Chunk>,
 ) -> Result<(), LibError> {
     chunks.reserve(raw_entries.len() / 4);
+    let mut overflow = false;
     let mut prev_rel = 0u64;
 
     for (i, raw) in raw_entries.chunks_exact(4).enumerate() {
         let stored = u32::from_le_bytes(raw.try_into().expect("table entries are 4 bytes")) as u64;
 
-        let (rel, compressed) = (stored & 0x7fffffff, stored & 0x80000000 != 0);
+        let (rel, compressed) = if overflow {
+            (stored, false)
+        } else {
+            let masked = stored & 0x7fffffff;
+            if i > 0 && masked < prev_rel && stored >= prev_rel {
+                overflow = true;
+                (stored, false)
+            } else {
+                (masked, stored & 0x80000000 != 0)
+            }
+        };
 
         if i > 0 {
             let prev = chunks.last_mut().expect("entry i - 1 was pushed");
@@ -440,6 +457,43 @@ mod tests {
                 (0x1300, 0, true)
             ]
         );
+    }
+
+    /// EnCase 6.7 segments past 2 GiB: offsets run on into the high bit. The
+    /// masked offset of the first entry past 2^31 goes backwards while its
+    /// full value goes forwards; that entry and every later one is a 32-bit
+    /// offset to an uncompressed chunk. Reading the high bit as the
+    /// compression flag there instead rejected the table as non-monotonic,
+    /// and so the image, which libewf reads.
+    #[test]
+    fn table_offsets_past_2gib_overflow_into_the_high_bit() {
+        let near = 0x7fff_8000u32; // a chunk starting 32 KiB short of 2 GiB
+        let chunks = table_chunks(
+            &entries(&[near | 0x8000_0000, 0x8000_0010, 0x8000_8014, 0x8001_0018]),
+            0,
+        )
+        .unwrap();
+        let got: Vec<_> = chunks
+            .iter()
+            .map(|c| (c.data_offset, c.end_offset, c.compressed))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (near as u64, 0x8000_0010, true),
+                (0x8000_0010, 0x8000_8014, false),
+                (0x8000_8014, 0x8001_0018, false),
+                (0x8001_0018, 0, false),
+            ]
+        );
+    }
+
+    /// A masked offset going backwards when the full value does too is no
+    /// overflow, just a corrupt table.
+    #[test]
+    fn backwards_offsets_without_overflow_are_still_an_error() {
+        let err = table_chunks(&entries(&[0x8000_1000, 0x0000_0800]), 0).unwrap_err();
+        assert!(matches!(err, LibError::CorruptChunkTable(_)), "got {err:?}");
     }
 
     /// entry_count is a raw u32 from the image; EWF caps table entries at
